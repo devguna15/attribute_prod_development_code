@@ -66,3 +66,44 @@ Host 52.72.154.231
 2. 40 requests submitted in the same instant → all competing for prefill compute at once
 3. Whichever finishes its 6-row generation first wins — not necessarily a fast process,
    just whichever got lucky with shorter output
+
+
+
+
+
+
+
+
+def warmup_prefix_cache():
+    """Send one request to warm the prefix cache before bulk processing."""
+    print("Warming prefix cache with single request...")
+    client = get_client()
+    
+    # Minimal warmup using the same system prompt structure
+    warmup_items = [{
+        "row_id": 1,
+        "hs_code": "9999",
+        "domain": "General Trade Goods",
+        "product_description": "warmup product"
+    }]
+    
+    warmup_prompt = PROMPT_TEMPLATE.format(
+        items_json=json.dumps({"items": warmup_items}, ensure_ascii=False)
+    )
+    
+    start = time.time()
+    try:
+        response = client.chat.completions.create(
+            model=MODEL_NAME,
+            temperature=0,
+            max_tokens=100,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": warmup_prompt},
+            ],
+        )
+        elapsed = time.time() - start
+        print(f"Prefix cache warmed in {elapsed:.1f}s")
+    except Exception as e:
+        print(f"Warmup failed: {e}")
