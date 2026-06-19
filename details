@@ -1,0 +1,68 @@
+source ~/gemma-4b/.venv/bin/activate
+cd ~/attributes
+
+vllm serve cyankiwi/gemma-4-31B-it-AWQ-4bit \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --gpu-memory-utilization 0.90 \
+  --max-model-len 12000
+  
+vllm serve Qwen/Qwen3-Embedding-4B \
+  --host 0.0.0.0 \
+  --port 8001 \
+  --runner pooling \
+  --convert embed \
+  --gpu-memory-utilization 0.24 \
+  --max-model-len 8192
+
+
+curl http://127.0.0.1:8000/v1/models
+
+
+vllm serve cyankiwi/gemma-4-31B-it-AWQ-4bit \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --tensor-parallel-size 2 \
+  --data-parallel-size 4 \
+  --gpu-memory-utilization 0.90 \
+  --max-model-len 12000 \
+  --max-num-batched-tokens 8192 \
+  --max-num-seqs 128 \
+  --kv-cache-dtype fp8 \
+  --dtype bfloat16 \
+  --load-format safetensors \
+  --enable-prefix-caching \
+  --enable-chunked-prefill \
+  --async-scheduling
+  
+  
+  C:\Users\Guna shekar\.ssh\id_rsa (1) 
+  
+  Host myserver
+    HostName 101.53.140.154
+    User root
+    IdentityFile C:\Users\Guna shekar\.ssh\id_rsa
+    IdentitiesOnly yes
+	
+	
+Host 100.52.120.227
+  HostName 100.52.120.227
+  user cortex_gunashekhar
+
+Host 172.16.16.40
+  HostName 172.16.16.40
+  User tdb
+
+Host 52.72.154.231
+  HostName 52.72.154.231
+  user gunashekhar
+	
+	
+	
+	
+	
+1. Cold prefix cache → full prompt (SYSTEM_PROMPT + PROMPT_TEMPLATE instructions) 
+   gets reprocessed from scratch on every single one of the 40 simultaneous requests
+2. 40 requests submitted in the same instant → all competing for prefill compute at once
+3. Whichever finishes its 6-row generation first wins — not necessarily a fast process,
+   just whichever got lucky with shorter output
