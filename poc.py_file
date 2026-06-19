@@ -1,0 +1,999 @@
+import csv
+import json
+import os
+import re
+import time
+import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
+
+import pandas as pd
+import requests
+from openai import OpenAI
+
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+INPUT_FILE = "/home/gunashekhar/attributes/Sample 1.csv"
+
+OUTPUT_FILE = "sample1_output.csv"
+PENDING_FILE = "sample1_pending.csv"
+ERROR_FILE = "sample1_errors.csv"
+METRICS_FILE = "sample1_metrics.csv"
+
+BASE_URL = "http://127.0.0.1:8000/v1"
+VLLM_METRICS_URL = "http://127.0.0.1:8000/metrics"
+API_KEY = "dummy"
+MODEL_NAME = "cyankiwi/gemma-4-31B-it-AWQ-4bit"
+
+BATCH_SIZE = 3
+MAX_WORKERS = 4
+MAX_RETRIES = 3
+RETRY_SLEEP_SECONDS = 3
+MAX_TOKENS = 5000
+
+CLEAR_EXISTING_OUTPUTS = False
+MAX_RECORDS = None
+
+HS_CODE_COLUMN = None
+DESCRIPTION_COLUMN = None
+
+
+# ============================================================
+# PROMPT
+# ============================================================
+
+SYSTEM_PROMPT = """You are a Lead Trade Data Taxonomist for a global trade intelligence platform.
+
+You generate the final customer-facing flat JSON attribute map for products.
+
+Return ONLY valid JSON.
+Do not include reasoning.
+Do not include markdown.
+Do not include explanations."""
+
+
+PROMPT_TEMPLATE = """Role: You are a Lead Trade Data Taxonomist for a global trade intelligence platform. Your task is to generate the final customer-facing flat JSON attribute map for each product.
+
+INPUTS
+
+You will receive a JSON array named "items".
+
+Each item contains:
+- row_id
+- hs_code
+- domain
+- product_description
+
+You must return a SINGLE valid JSON object with this structure:
+
+{{
+  "results": [
+    {{
+      "row_id": 1,
+      "nested": false,
+      "Product Type": "Clean generic product type",
+      "Attributes": {{
+        "Attribute Key": "Attribute Value"
+      }}
+    }}
+  ]
+}}
+
+OR, if the description clearly contains multiple distinct products:
+
+{{
+  "results": [
+    {{
+      "row_id": 1,
+      "nested": true,
+      "canonical_similarity_score": 0.0,
+      "products": [
+        {{
+          "Product Type": "Product 1 type",
+          "Attribute Key": "Attribute Value"
+        }},
+        {{
+          "Product Type": "Product 2 type",
+          "Attribute Key": "Attribute Value"
+        }}
+      ]
+    }}
+  ]
+}}
+
+Return exactly one result object for each input item.
+Do not skip any item.
+Do not duplicate any item.
+Use the same row_id from the input.
+Return ONLY valid JSON.
+
+STEP 1 — INTERNAL ALIGNMENT (DO NOT OUTPUT)
+
+IMPORTANT FIRST RULE:
+Identify and Select the most specific and accurate product name for Product Type key based on the child-level description only to anchor all subsequent logic.
+
+PRODUCT TYPE RULE:
+Product Type should answer: "What is this item?"
+
+It must be a clean generic product type supported by the description, not a broad domain label.
+Avoid overly broad classes such as Pharmaceuticals, Food, Apparel, Machinery, or Consumer Goods when a more specific product type is present.
+
+Do NOT include brand names, flavors, sizes, dimensions, pack counts, quantities, weights, grades, model numbers, condition, origin, container/shipment details, or other commercial modifiers in "Product Type".
+
+Move those details into separate attribute keys such as Brand, Flavor, Variant, Dimensions, Packaging, Quantity, Net Weight, Model Number, Condition, Origin, or Container Type.
+
+ATTRIBUTE EXTRACTION:
+Extract only domain-relevant and technically meaningful attributes that are supported by the item description.
+
+If a specific value, measurement, count, material, model, grade, size, or technical detail exists in the description, assign it to the correct attribute key.
+Do not create a field unless the field name itself is supported by the description or is an unambiguous standard mapping.
+
+CHILD-ONLY RULE:
+Add attributes only when supported by explicit evidence in the item description.
+
+Do not invent specialized technical keys whose values would only be generic placeholders.
+
+ABBREVIATION HANDLING:
+Inspect abbreviations and short forms in the item description.
+
+Use the HS Code, Domain, and surrounding context to interpret abbreviations when the meaning is clear.
+
+If an abbreviation is ambiguous, do not force expansion. Preserve it as written under the most appropriate key, or omit it if it is not useful.
+
+Do not convert an abbreviation into a specialized technical claim unless the description clearly supports that meaning.
+
+LOGISTICS EXTRACTION:
+Look for unit multipliers, pack patterns, quantities, and shipment/logistics details such as "12 x 750ml", "129 BOX", "20 PKTS x 25 CTN", "36 PCS", "1x20 DRY CONTAINER".
+
+Map them to the correct keys such as Packaging, Pack Configuration, Quantity, Unit Volume, Dimensions, Container Type, or related logistics attributes.
+
+BRAND IDENTIFICATION:
+If a brand or commercial brand-like name is present in the item description, extract it into a separate "Brand" key.
+
+Do not include brand names inside "Product Type".
+
+Use the item description, HS Code, Domain, and trained knowledge of common brands to judge whether a token is likely to be a brand.
+
+Do not treat active ingredients, molecule names, chemical names, material names, or generic technical descriptors as Brand unless the description clearly indicates a commercial brand.
+
+If Brand is extracted, also output "Brand Confidence" using one of:
+"High", "Medium", "Low"
+
+- High = explicitly labeled as brand/make/manufacturer, or strongly recognized as a brand in context
+- Medium = likely brand based on naming pattern, token position, domain fit, and trained knowledge
+- Low = weak or uncertain brand-like signal
+
+If no clear brand is present, do not output Brand or Brand Confidence.
+
+HS CODE RESOLUTION:
+Only extract HS Code from the description when it is explicitly marked by cues like HS, HS CODE, HSN, HSNO, or similar. Do not infer HS codes from standalone numbers, quantities, invoice numbers, PO numbers, weights, or shipment counts.
+
+If one or more HS codes appear inside the item description, output at most one final "HS Code" and also "HS Code Confidence".
+
+If multiple HS-like codes appear, choose the single most likely code using:
+- proximity to the product name
+- consistency with the product type
+- consistency with the domain
+- preference for the most complete valid code when shorter forms are truncated duplicates or fragments
+
+If HS Code is extracted from the description, also output "HS Code Confidence" using one of:
+"High", "Medium", "Low"
+
+Never output multiple HS Code values.
+
+MULTI-PRODUCT RULE:
+If, after applying the Product Type rules, the item description resolves to one single "Product Type", return:
+- "nested": false
+
+Do not create nested output for closely related variants, flavors, sizes, strengths, pack configurations, dosage forms, specifications, line items, SKUs, or commercial sub-lines that still resolve to the same "Product Type".
+
+Return:
+- "nested": true
+- "canonical_similarity_score": 0 to 1
+- "products": [ ... ]
+
+only when the description clearly contains more than one distinct product family or commercially different product, where each product would reasonably stand as a separate item on its own.
+
+Each item inside "products" must be a separate flat JSON object with its own "Product Type" and related attributes.
+
+Each item inside "products" must independently follow all the same rules above, including internal alignment, Product Type rules, attribute extraction, abbreviation handling, brand identification, HS code resolution, category-aware generalization, and no redundancy, based only on the text relevant to that product.
+
+STRICT NESTED PRODUCT TYPE RULE:
+If "nested": true, the product objects inside "products" must represent clearly different product types or different product families.
+
+Do not return nested output when the product objects would have the same "Product Type" or effectively the same product family with only differences in model number, size, width, strength, packaging, quantity, or other technical/commercial variants.
+
+In such cases, return:
+- "nested": false
+
+and merge the differing values into arrays under the same attribute keys.
+
+Do not merge clearly different product families into one Product Type.
+Do not output multiple Product Type values in a single flat object unless "nested": true.
+
+If nested is true, "canonical_similarity_score" must be a number between 0 and 1 that represents how closely the nested products belong to the same broader commercial grouping:
+- closer to 1 = more closely related
+- closer to 0 = more commercially different
+
+If nested is false, do not output canonical_similarity_score.
+
+When uncertain, prefer "nested": false unless the description clearly supports separate commercially distinct products.
+
+CATEGORY-AWARE GENERALIZATION:
+If a broad commercial or logistics attribute is useful but its exact value is not present in the item description, you may use a safe placeholder adapted to the domain.
+
+Examples of safe placeholders:
+- "Standard Grade (Refer to Product Label or Certificate of Analysis)"
+- "Refer to Product Label or Manufacturer Website"
+- "Standard Industrial Specification (Refer to Datasheet/Manual)"
+- "Standard Industrial Size (Refer to Technical Drawing/Packaging)"
+- "Calculated at Time of Shipping / As per Invoice"
+- "Refer to Shipping Documents/Bill of Lading"
+
+Use such placeholders only for broad commercial/logistics attributes like Grade, Packaging, Quantity, Weight, Ingredients, Manufacturer, or similar.
+
+Do NOT use placeholders to invent specialized unsupported technical fields.
+
+NO REDUNDANCY:
+If an attribute value is identical to "Product Type", do not repeat it in another key.
+
+STEP 2 — STRUCTURE
+
+Output a SINGLE JSON object with key "results".
+
+For each result:
+- If single product:
+  - return "row_id"
+  - return "nested": false
+  - return "Product Type"
+  - return "Attributes"
+- If multiple products:
+  - return "row_id"
+  - return "nested": true
+  - return "products"
+  - return "canonical_similarity_score"
+
+For single-product results:
+- "Attributes" must be a flat JSON object.
+- Do not include "Product Type" again inside "Attributes".
+
+For multi-product results:
+- "products" must be an array of flat JSON objects.
+- Each product object must include its own "Product Type".
+
+All list-type values must be standard JSON arrays: ["Value 1", "Value 2"].
+
+Do not output empty arrays, empty strings, nulls, or "N/A".
+
+INPUT JSON:
+{items_json}
+
+FINAL JSON:"""
+
+
+# ============================================================
+# HS DOMAIN MAPPING
+# ============================================================
+
+HS_MAPPING = {
+    "01-05": "Live Animals",
+    "06-14": "Vegetable Products",
+    "15": "Animal, Vegetable Or Microbial Fats And Oils And Their Cleavage Products; Prepared Edible Fats; Animal Or Vegetable Waxes",
+    "16-24": "Prepared Foodstuffs; Beverages, Spirits And Vinegar; Tobacco And Manufactured Tobacco Substitutes",
+    "25-27": "Mineral Products",
+    "28-38": "Products Of The Chemical Or Allied Industries",
+    "39-40": "Plastics And Articles Thereof; Rubber And Articles Thereof",
+    "41-43": "Raw Hides And Skins, Leather, Furskins; Articles Of Animal Gut",
+    "44-46": "Wood And Articles Of Wood; Cork; Basketware and Wickerwork",
+    "47-49": "Pulp Of Wood; Recovered Paper; Paper and Paperboard Articles",
+    "50-63": "Textile And Textile Articles",
+    "64-67": "Footwear, Headgear, Artificial Flowers; Articles Of Human Hair",
+    "68-70": "Articles Of Stone, Plaster, Cement, Asbestos, Mica; Glass And Glassware",
+    "71": "Natural Or Cultured Pearls, Precious Metals, and Articles Thereof; Imitation Jewellery",
+    "72-83": "Base Metals And Articles Of Base Metal",
+    "84-85": "Machinery And Mechanical Appliances; Electrical Equipment; Sound and TV Recorders",
+    "86-89": "Vehicles, Aircraft, Vessels And Associated Transport Equipment",
+    "90-92": "Optical, Medical Or Surgical Instruments; Clocks; Musical Instruments",
+    "93": "Arms And Ammunition; Parts And Accessories Thereof",
+    "94-96": "Miscellaneous Manufactured Articles",
+    "97": "Works Of Art, Collectors' Pieces And Antiques",
+}
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def get_domain(hs_code: str) -> str:
+    try:
+        hs_int = int(str(hs_code).strip().zfill(4)[:2])
+        for k, v in HS_MAPPING.items():
+            if "-" in k:
+                lo, hi = map(int, k.split("-"))
+                if lo <= hs_int <= hi:
+                    return v
+            elif int(k) == hs_int:
+                return v
+    except Exception:
+        pass
+    return "General Trade Goods"
+
+
+def normalize_text(value) -> str:
+    if pd.isna(value):
+        return ""
+    text = str(value).strip()
+    return re.sub(r"\s+", " ", text)
+
+
+def detect_columns(df: pd.DataFrame) -> tuple[str, str]:
+    cols = list(df.columns)
+
+    if HS_CODE_COLUMN and DESCRIPTION_COLUMN:
+        if HS_CODE_COLUMN not in cols or DESCRIPTION_COLUMN not in cols:
+            raise ValueError(f"Configured columns not found. Available columns: {cols}")
+        return HS_CODE_COLUMN, DESCRIPTION_COLUMN
+
+    normalized = {c.lower().strip(): c for c in cols}
+
+    hs_candidates = [
+        "hs_code", "hscode", "hs code", "hs", "itc_hs_code",
+        "hsn", "hsn_code", "hsn code"
+    ]
+    desc_candidates = [
+        "product_description", "product description", "description",
+        "item_description", "item description", "product_desc",
+        "goods_description", "goods description", "product desc"
+    ]
+
+    hs_col = next((normalized[c] for c in hs_candidates if c in normalized), None)
+    desc_col = next((normalized[c] for c in desc_candidates if c in normalized), None)
+
+    if hs_col and desc_col:
+        return hs_col, desc_col
+
+    hs_col = None
+    desc_col = None
+    for c in cols:
+        lc = c.lower()
+        if hs_col is None and ("hs" in lc or "hscode" in lc or "hsn" in lc):
+            hs_col = c
+        if desc_col is None and ("desc" in lc or "description" in lc or "item" in lc):
+            desc_col = c
+
+    if not hs_col or not desc_col:
+        raise ValueError(
+            "Could not auto-detect HS code and description columns. "
+            f"Available columns: {cols}. Set HS_CODE_COLUMN and DESCRIPTION_COLUMN in CONFIG."
+        )
+
+    return hs_col, desc_col
+
+
+def clear_old_files() -> None:
+    if not CLEAR_EXISTING_OUTPUTS:
+        return
+    for path in [OUTPUT_FILE, PENDING_FILE, ERROR_FILE, METRICS_FILE]:
+        if os.path.exists(path):
+            os.remove(path)
+
+
+def load_done_keys(*file_paths: str) -> set[tuple[str, str]]:
+    done = set()
+    for path in file_paths:
+        if not os.path.exists(path):
+            continue
+        with open(path, "r", newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                done.add(
+                    (
+                        normalize_text(row.get("hs_code", "")),
+                        normalize_text(row.get("product_description", "")),
+                    )
+                )
+    return done
+
+
+def build_batch_prompt(batch_rows: list[dict]) -> str:
+    items = []
+    for row in batch_rows:
+        items.append(
+            {
+                "row_id": row["row_id"],
+                "hs_code": row["hs_code"],
+                "domain": get_domain(row["hs_code"]),
+                "product_description": row["product_description"],
+            }
+        )
+    return PROMPT_TEMPLATE.format(
+        items_json=json.dumps({"items": items}, ensure_ascii=False)
+    )
+
+
+CLIENT = OpenAI(base_url=BASE_URL, api_key=API_KEY)
+
+def get_client() -> OpenAI:
+    return CLIENT
+
+
+def clean_json_text(text: str) -> str:
+    text = str(text).strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\s*```$", "", text)
+    return text.strip()
+
+
+def extract_json_object(text: str) -> dict:
+    cleaned = clean_json_text(text)
+    try:
+        parsed = json.loads(cleaned)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        pass
+
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        raise ValueError("No JSON object found in model output")
+
+    parsed = json.loads(cleaned[start:end + 1])
+    if not isinstance(parsed, dict):
+        raise ValueError("Parsed output is not a JSON object")
+    return parsed
+
+
+def normalize_product_type(value) -> str:
+    if isinstance(value, list):
+        value = ", ".join(str(x) for x in value)
+    return normalize_text(value)
+
+
+def normalize_attributes(value) -> dict:
+    if isinstance(value, dict):
+        return value
+    return {}
+
+
+def normalize_products_list(value) -> list[dict]:
+    if isinstance(value, list):
+        return [x for x in value if isinstance(x, dict)]
+    return []
+
+
+def attribute_count_for_result(product_type: str, attributes_obj: dict) -> int:
+    if not product_type:
+        return 0
+
+    if attributes_obj.get("nested") is True:
+        products = attributes_obj.get("products", [])
+        count = 0
+        if isinstance(products, list):
+            for product in products:
+                if isinstance(product, dict):
+                    for key in product.keys():
+                        if key != "Product Type":
+                            count += 1
+        return count
+
+    count = 0
+    for key in attributes_obj.keys():
+        if key != "nested":
+            count += 1
+    return count
+
+
+def parse_prometheus_metrics(text: str) -> dict:
+    metrics = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        try:
+            metric_part, value_part = line.rsplit(" ", 1)
+            metric_name = metric_part.split("{", 1)[0].strip()
+            value = float(value_part.strip())
+            metrics[metric_name] = metrics.get(metric_name, 0.0) + value
+        except Exception:
+            continue
+    return metrics
+
+
+def get_metric(metrics: dict, names: list[str], default=0.0):
+    for name in names:
+        if name in metrics:
+            return metrics[name]
+    return default
+
+
+def get_vllm_metrics_snapshot() -> dict:
+    try:
+        response = requests.get(VLLM_METRICS_URL, timeout=5)
+        if response.status_code != 200:
+            return {}
+
+        metrics = parse_prometheus_metrics(response.text)
+
+        prefix_queries = get_metric(
+            metrics,
+            ["vllm:prefix_cache_queries_total", "vllm:prefix_cache_queries"],
+            0.0,
+        )
+        prefix_hits = get_metric(
+            metrics,
+            ["vllm:prefix_cache_hits_total", "vllm:prefix_cache_hits"],
+            0.0,
+        )
+        kv_cache_usage = get_metric(
+            metrics,
+            ["vllm:kv_cache_usage_perc", "vllm:gpu_cache_usage_perc"],
+            0.0,
+        )
+        running_requests = get_metric(
+            metrics,
+            ["vllm:num_requests_running"],
+            0.0,
+        )
+        waiting_requests = get_metric(
+            metrics,
+            ["vllm:num_requests_waiting"],
+            0.0,
+        )
+
+        prefix_misses = prefix_queries - prefix_hits
+        if prefix_misses < 0:
+            prefix_misses = 0.0
+
+        return {
+            "prefix_queries": prefix_queries,
+            "prefix_hits": prefix_hits,
+            "prefix_misses": prefix_misses,
+            "kv_cache_usage": kv_cache_usage,
+            "running_requests": running_requests,
+            "waiting_requests": waiting_requests,
+        }
+    except Exception:
+        return {}
+
+
+def build_vllm_metrics_delta(before: dict, after: dict) -> dict:
+    prefix_queries_delta = after.get("prefix_queries", 0.0) - before.get("prefix_queries", 0.0)
+    prefix_hits_delta = after.get("prefix_hits", 0.0) - before.get("prefix_hits", 0.0)
+    prefix_misses_delta = after.get("prefix_misses", 0.0) - before.get("prefix_misses", 0.0)
+
+    if prefix_misses_delta < 0:
+        prefix_misses_delta = ""
+
+    if prefix_queries_delta > 0:
+        prefix_hit_rate_delta = round(prefix_hits_delta / prefix_queries_delta, 4)
+    else:
+        prefix_hit_rate_delta = ""
+
+    return {
+        "prefix_queries_delta": prefix_queries_delta,
+        "prefix_hits_delta": prefix_hits_delta,
+        "prefix_misses_delta": prefix_misses_delta,
+        "prefix_hit_rate_delta": prefix_hit_rate_delta,
+        "kv_cache_usage_before": before.get("kv_cache_usage", ""),
+        "kv_cache_usage_after": after.get("kv_cache_usage", ""),
+        "running_requests_before": before.get("running_requests", ""),
+        "running_requests_after": after.get("running_requests", ""),
+        "waiting_requests_before": before.get("waiting_requests", ""),
+        "waiting_requests_after": after.get("waiting_requests", ""),
+    }
+
+
+# ============================================================
+# CSV HELPERS
+# ============================================================
+
+OUTPUT_FIELDNAMES = [
+    "hs_code",
+    "product_description",
+    "product_type",
+    "attributes",
+]
+
+ERROR_FIELDNAMES = [
+    "batch_id",
+    "row_id",
+    "hs_code",
+    "product_description",
+    "error",
+    "raw_model_output",
+]
+
+METRIC_FIELDNAMES = [
+    "batch_id",
+    "rows_in_batch",
+    "row_ids",
+    "status",
+    "attempt",
+    "error",
+    "start_ts_utc",
+    "end_ts_utc",
+    "request_duration_sec",
+    "rows_per_sec",
+    "prompt_tokens_api",
+    "completion_tokens_api",
+    "total_tokens_api",
+    "prefix_queries_delta",
+    "prefix_hits_delta",
+    "prefix_misses_delta",
+    "prefix_hit_rate_delta",
+    "kv_cache_usage_before",
+    "kv_cache_usage_after",
+    "running_requests_before",
+    "running_requests_after",
+    "waiting_requests_before",
+    "waiting_requests_after",
+]
+
+
+def append_csv(file_path: str, rows: list[dict], fieldnames: list[str]) -> None:
+    if not rows:
+        return
+    file_exists = os.path.exists(file_path) and os.path.getsize(file_path) > 0
+    with open(file_path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if not file_exists:
+            writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+        f.flush()
+        os.fsync(f.fileno())
+
+
+# ============================================================
+# MODEL CALL
+# ============================================================
+
+def call_model_batch(batch_id: int, batch_rows: list[dict]) -> tuple[list[dict], list[dict], list[dict], dict]:
+    client = get_client()
+    prompt = build_batch_prompt(batch_rows)
+
+    last_error = ""
+    last_content = ""
+    row_ids = [str(row["row_id"]) for row in batch_rows]
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        request_start_perf = time.perf_counter()
+        start_ts = utc_now_iso()
+        vllm_before = get_vllm_metrics_snapshot()
+
+        try:
+            response = client.chat.completions.create(
+                model=MODEL_NAME,
+                temperature=0,
+                max_tokens=MAX_TOKENS,
+                response_format={"type": "json_object"},
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt},
+                ],
+            )
+
+            end_ts = utc_now_iso()
+            vllm_after = get_vllm_metrics_snapshot()
+            request_duration_sec = time.perf_counter() - request_start_perf
+            vllm_delta = build_vllm_metrics_delta(vllm_before, vllm_after)
+
+            content = response.choices[0].message.content or "{}"
+            last_content = content
+
+            parsed = extract_json_object(content)
+            results = parsed.get("results")
+
+            if not isinstance(results, list):
+                raise ValueError("Model output does not contain results array")
+
+            results_by_row_id = {}
+            for item in results:
+                if not isinstance(item, dict):
+                    continue
+                row_id = item.get("row_id")
+                try:
+                    row_id = int(row_id)
+                except Exception:
+                    continue
+                results_by_row_id[row_id] = item
+
+            output_rows = []
+            pending_rows = []
+            error_rows = []
+
+            for row in batch_rows:
+                row_id = row["row_id"]
+                result_item = results_by_row_id.get(row_id)
+
+                if not result_item:
+                    error_rows.append(
+                        {
+                            "batch_id": batch_id,
+                            "row_id": row_id,
+                            "hs_code": row["hs_code"],
+                            "product_description": row["product_description"],
+                            "error": "Missing result for row_id",
+                            "raw_model_output": last_content,
+                        }
+                    )
+                    continue
+
+                nested = result_item.get("nested", False)
+
+                if nested is True:
+                    products = normalize_products_list(result_item.get("products", []))
+                    score = result_item.get("canonical_similarity_score", "")
+                    try:
+                        score = float(score)
+                    except Exception:
+                        score = ""
+
+                    product_type = "NESTED"
+                    attributes_obj = {
+                        "nested": True,
+                        "canonical_similarity_score": score,
+                        "products": products,
+                    }
+                else:
+                    product_type = normalize_product_type(result_item.get("Product Type", ""))
+                    attributes = normalize_attributes(result_item.get("Attributes", {}))
+                    attributes_obj = {
+                        "nested": False,
+                        **attributes,
+                    }
+
+                row_out = {
+                    "hs_code": row["hs_code"],
+                    "product_description": row["product_description"],
+                    "product_type": product_type,
+                    "attributes": json.dumps(attributes_obj, ensure_ascii=False),
+                }
+
+                attr_len = attribute_count_for_result(product_type, attributes_obj)
+
+                if attr_len < 2:
+                    pending_rows.append(row_out)
+                else:
+                    output_rows.append(row_out)
+
+            usage = getattr(response, "usage", None)
+            metric_row = {
+                "batch_id": batch_id,
+                "rows_in_batch": len(batch_rows),
+                "row_ids": ";".join(row_ids),
+                "status": "success" if not error_rows else "partial_error",
+                "attempt": attempt,
+                "error": "" if not error_rows else f"{len(error_rows)} rows missing/invalid",
+                "start_ts_utc": start_ts,
+                "end_ts_utc": end_ts,
+                "request_duration_sec": round(request_duration_sec, 4),
+                "rows_per_sec": round(len(batch_rows) / request_duration_sec, 4) if request_duration_sec > 0 else "",
+                "prompt_tokens_api": getattr(usage, "prompt_tokens", "") if usage else "",
+                "completion_tokens_api": getattr(usage, "completion_tokens", "") if usage else "",
+                "total_tokens_api": getattr(usage, "total_tokens", "") if usage else "",
+                "prefix_queries_delta": vllm_delta.get("prefix_queries_delta", ""),
+                "prefix_hits_delta": vllm_delta.get("prefix_hits_delta", ""),
+                "prefix_misses_delta": vllm_delta.get("prefix_misses_delta", ""),
+                "prefix_hit_rate_delta": vllm_delta.get("prefix_hit_rate_delta", ""),
+                "kv_cache_usage_before": vllm_delta.get("kv_cache_usage_before", ""),
+                "kv_cache_usage_after": vllm_delta.get("kv_cache_usage_after", ""),
+                "running_requests_before": vllm_delta.get("running_requests_before", ""),
+                "running_requests_after": vllm_delta.get("running_requests_after", ""),
+                "waiting_requests_before": vllm_delta.get("waiting_requests_before", ""),
+                "waiting_requests_after": vllm_delta.get("waiting_requests_after", ""),
+            }
+
+            return output_rows, pending_rows, error_rows, metric_row
+
+        except Exception as exc:
+            last_error = str(exc)
+            if attempt < MAX_RETRIES:
+                time.sleep(RETRY_SLEEP_SECONDS)
+
+    metric_row = {
+        "batch_id": batch_id,
+        "rows_in_batch": len(batch_rows),
+        "row_ids": ";".join(row_ids),
+        "status": "error",
+        "attempt": MAX_RETRIES,
+        "error": last_error,
+        "start_ts_utc": "",
+        "end_ts_utc": "",
+        "request_duration_sec": "",
+        "rows_per_sec": "",
+        "prompt_tokens_api": "",
+        "completion_tokens_api": "",
+        "total_tokens_api": "",
+        "prefix_queries_delta": "",
+        "prefix_hits_delta": "",
+        "prefix_misses_delta": "",
+        "prefix_hit_rate_delta": "",
+        "kv_cache_usage_before": "",
+        "kv_cache_usage_after": "",
+        "running_requests_before": "",
+        "running_requests_after": "",
+        "waiting_requests_before": "",
+        "waiting_requests_after": "",
+    }
+
+    error_rows = []
+    for row in batch_rows:
+        error_rows.append(
+            {
+                "batch_id": batch_id,
+                "row_id": row["row_id"],
+                "hs_code": row["hs_code"],
+                "product_description": row["product_description"],
+                "error": last_error,
+                "raw_model_output": last_content,
+            }
+        )
+
+    return [], [], error_rows, metric_row
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main() -> None:
+    if not os.path.exists(INPUT_FILE):
+        raise FileNotFoundError(
+            f"Input file '{INPUT_FILE}' not found in current directory: {os.getcwd()}"
+        )
+
+    clear_old_files()
+
+    print("========== ATTRIBUTE PRODUCTION RUN START ==========")
+    print(f"Model: {MODEL_NAME}")
+    print(f"Input file: {INPUT_FILE}")
+    print(f"Output file: {OUTPUT_FILE}")
+    print(f"Pending file: {PENDING_FILE}")
+    print(f"Error file: {ERROR_FILE}")
+    print(f"Metrics file: {METRICS_FILE}")
+    print(f"Batch size: {BATCH_SIZE}")
+    print(f"Max workers: {MAX_WORKERS}")
+    print("===================================================")
+
+    df = pd.read_csv(INPUT_FILE)
+    hs_col, desc_col = detect_columns(df)
+
+    print(f"Detected HS code column: {hs_col}")
+    print(f"Detected description column: {desc_col}")
+
+    done_keys = load_done_keys(OUTPUT_FILE, PENDING_FILE, ERROR_FILE)
+    print(f"Already completed rows found: {len(done_keys)}")
+
+    selected_rows = []
+    for _, row in df.iterrows():
+        hs_code = normalize_text(row[hs_col])
+        product_description = normalize_text(row[desc_col])
+
+        if not product_description:
+            continue
+
+        selected_rows.append(
+            {
+                "row_id": len(selected_rows) + 1,
+                "hs_code": hs_code,
+                "product_description": product_description,
+            }
+        )
+
+        if MAX_RECORDS is not None and len(selected_rows) >= MAX_RECORDS:
+            break
+
+    pending_input_rows = []
+    for row in selected_rows:
+        key = (row["hs_code"], row["product_description"])
+        if key not in done_keys:
+            pending_input_rows.append(row)
+
+    print(f"Rows selected: {len(selected_rows)}")
+    print(f"Rows pending after resume check: {len(pending_input_rows)}")
+
+    if not pending_input_rows:
+        print("Nothing to process. All rows already handled.")
+        return
+
+    batches = []
+    for i in range(0, len(pending_input_rows), BATCH_SIZE):
+        batch_rows = pending_input_rows[i:i + BATCH_SIZE]
+        batch_id = len(batches) + 1
+        batches.append((batch_id, batch_rows))
+
+    print(f"Total prompt batches: {len(batches)}")
+
+    total_output = 0
+    total_pending = 0
+    total_errors = 0
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {
+            executor.submit(call_model_batch, batch_id, batch_rows): (batch_id, batch_rows)
+            for batch_id, batch_rows in batches
+        }
+
+        for future in as_completed(futures):
+            batch_id, batch_rows = futures[future]
+
+            try:
+                output_rows, pending_rows, error_rows, metric_row = future.result()
+            except Exception as exc:
+                output_rows = []
+                pending_rows = []
+                error_rows = []
+                for row in batch_rows:
+                    error_rows.append(
+                        {
+                            "batch_id": batch_id,
+                            "row_id": row["row_id"],
+                            "hs_code": row["hs_code"],
+                            "product_description": row["product_description"],
+                            "error": str(exc),
+                            "raw_model_output": "",
+                        }
+                    )
+                metric_row = {
+                    "batch_id": batch_id,
+                    "rows_in_batch": len(batch_rows),
+                    "row_ids": ";".join(str(row["row_id"]) for row in batch_rows),
+                    "status": "error",
+                    "attempt": MAX_RETRIES,
+                    "error": str(exc),
+                    "start_ts_utc": "",
+                    "end_ts_utc": "",
+                    "request_duration_sec": "",
+                    "rows_per_sec": "",
+                    "prompt_tokens_api": "",
+                    "completion_tokens_api": "",
+                    "total_tokens_api": "",
+                    "prefix_queries_delta": "",
+                    "prefix_hits_delta": "",
+                    "prefix_misses_delta": "",
+                    "prefix_hit_rate_delta": "",
+                    "kv_cache_usage_before": "",
+                    "kv_cache_usage_after": "",
+                    "running_requests_before": "",
+                    "running_requests_after": "",
+                    "waiting_requests_before": "",
+                    "waiting_requests_after": "",
+                }
+
+            append_csv(OUTPUT_FILE, output_rows, OUTPUT_FIELDNAMES)
+            append_csv(PENDING_FILE, pending_rows, OUTPUT_FIELDNAMES)
+            append_csv(ERROR_FILE, error_rows, ERROR_FIELDNAMES)
+            append_csv(METRICS_FILE, [metric_row], METRIC_FIELDNAMES)
+
+            total_output += len(output_rows)
+            total_pending += len(pending_rows)
+            total_errors += len(error_rows)
+
+            print(
+                f"Completed batch {batch_id}/{len(batches)} | "
+                f"output={len(output_rows)} | pending={len(pending_rows)} | errors={len(error_rows)}"
+            )
+
+    print("\n========== ATTRIBUTE PRODUCTION RUN COMPLETE ==========")
+    print(f"Successful output rows: {total_output}")
+    print(f"Pending rows (<2 attributes): {total_pending}")
+    print(f"Error rows: {total_errors}")
+    print(f"Output CSV: {OUTPUT_FILE}")
+    print(f"Pending CSV: {PENDING_FILE}")
+    print(f"Error CSV: {ERROR_FILE}")
+    print(f"Metrics CSV: {METRICS_FILE}")
+    print("=======================================================")
+
+
+if __name__ == "__main__":
+    main()
