@@ -1,0 +1,2264 @@
+#!/usr/bin/env python3
+"""
+Production-ready attribute generation runner for large CSV inputs.
+
+Design goals:
+- Input columns: hs_code, product_description
+- Create stable row_id from input order and record_uuid from the input UUID column
+- Batch size fixed at 6 by default
+- Normal concurrency: 40 workers
+- Backpressure concurrency: 12 workers
+- SQLite status.db is the scalable resume source of truth; master_status.csv remains audit
+- Split outputs: success, low-attribute, model errors, server failures, OOM failures, metrics
+- Bounded in-flight scheduler: do not submit whole file at once
+- Retry server errors with exponential backoff
+- Abort safely on startup server failure, repeated server failures, or OOM
+
+Example:
+    python attribute_production_runner.py \
+      --input /home/gunashekhar/attributes/Sample_1.csv \
+      --output-dir /home/gunashekhar/attributes/run_001
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import os
+import re
+import signal
+import sqlite3
+import sys
+import threading
+import time
+from concurrent.futures import FIRST_COMPLETED, ALL_COMPLETED, ThreadPoolExecutor, wait
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from enum import Enum
+from typing import Dict, Iterable, Iterator, List, Optional, Set, Tuple
+
+import pandas as pd
+import requests
+from openai import OpenAI
+
+
+# ============================================================
+# DEFAULT CONFIG
+# ============================================================
+
+# ============================================================
+# USER CONFIG - EDIT ONLY THIS SECTION
+# ============================================================
+
+# Put your input/output paths here. Then run:
+#     python attribute_production_runner_fixed_paths.py
+#
+# Supported input format for production:
+#   .csv only
+
+INPUT_FILE = "/home/jovyan/remaining_rows_id.csv"
+OUTPUT_DIR = "/home/jovyan/attribute_run_uuid"
+
+# AUTO means the script counts valid rows in the CSV and uses that count.
+# You may still set an integer like 500 for a small test run.
+MAX_RECORDS = "AUTO"
+
+# If your HS/description columns are exactly hs_code and product_description, keep those blank.
+# UUID_COLUMN must point to the unique row UUID column in your CSV.
+HS_CODE_COLUMN = ""
+DESCRIPTION_COLUMN = ""
+UUID_COLUMN = "UUID"
+
+# Set True only when you want to delete old outputs in OUTPUT_DIR and start fresh.
+CLEAR_EXISTING_OUTPUTS = False
+
+# Resume/status backend. Keep True for large production runs.
+# status.db is used for fast indexed UUID-based resume; master_status.csv is still written as an audit file.
+USE_SQLITE_STATUS = True
+STATUS_DB_FILENAME = "status_uuid.db"
+MIGRATE_MASTER_STATUS_TO_SQLITE = True
+
+# Model/server config
+BASE_URL = "http://127.0.0.1:8000/v1"
+VLLM_METRICS_URL = "http://127.0.0.1:8000/metrics"
+API_KEY = "dummy"
+MODEL_NAME = "cyankiwi/gemma-4-31B-it-AWQ-4bit"
+
+# Runtime config
+BATCH_SIZE = 6
+NORMAL_WORKERS = 40
+BACKPRESSURE_WORKERS = 12
+MAX_TOKENS = 5000
+GRACEFUL_SHUTDOWN_WAIT_SECONDS = 120
+
+DEFAULT_BASE_URL = BASE_URL
+DEFAULT_VLLM_METRICS_URL = VLLM_METRICS_URL
+DEFAULT_API_KEY = API_KEY
+DEFAULT_MODEL_NAME = MODEL_NAME
+
+DEFAULT_BATCH_SIZE = BATCH_SIZE
+DEFAULT_NORMAL_WORKERS = NORMAL_WORKERS
+DEFAULT_BACKPRESSURE_WORKERS = BACKPRESSURE_WORKERS
+
+DEFAULT_MAX_TOKENS = MAX_TOKENS
+DEFAULT_GRACEFUL_SHUTDOWN_WAIT_SECONDS = GRACEFUL_SHUTDOWN_WAIT_SECONDS
+DEFAULT_REQUEST_TIMEOUT_SECONDS = 600
+DEFAULT_SERVER_MAX_ATTEMPTS = 5
+DEFAULT_BACKOFF_SECONDS = [5, 15, 30, 60]
+DEFAULT_MAX_CONSECUTIVE_SERVER_FAILURES = 10
+
+DEFAULT_METRICS_POLL_SECONDS = 30
+DEFAULT_BACKPRESSURE_DURATION_SECONDS = 30 * 60
+DEFAULT_KV_IMMEDIATE_BACKPRESSURE = 0.95
+DEFAULT_KV_STREAK_BACKPRESSURE = 0.93
+DEFAULT_KV_STREAK_CHECKS = 3
+DEFAULT_KV_EXIT_STREAK_CHECKS = 3  # consecutive good polls required before exiting backpressure (3 * 30s poll = 90s)
+DEFAULT_KV_EXIT_BACKPRESSURE = 0.80
+DEFAULT_WAITING_HIGH = 10
+DEFAULT_WAITING_HIGH_STREAK_CHECKS = 3
+
+DEFAULT_CHUNKSIZE = 10000
+LOW_ATTRIBUTE_THRESHOLD = 2
+
+
+# ============================================================
+# PROMPT
+# ============================================================
+
+SYSTEM_PROMPT = """You are a Lead Trade Data Taxonomist for a global trade intelligence platform.
+
+You generate the final customer-facing flat JSON attribute map for products.
+
+Return ONLY valid JSON.
+Do not include reasoning.
+Do not include markdown.
+Do not include explanations."""
+
+
+PROMPT_TEMPLATE = """Role: You are a Lead Trade Data Taxonomist for a global trade intelligence platform. Your task is to generate the final customer-facing flat JSON attribute map for each product.
+
+INPUTS
+
+You will receive a JSON array named "items".
+
+Each item contains:
+- row_id
+- hs_code
+- domain
+- product_description
+
+You must return a SINGLE valid JSON object with this structure:
+
+{{
+  "results": [
+    {{
+      "row_id": 1,
+      "nested": false,
+      "Product Type": "Clean generic product type",
+      "Attributes": {{
+        "Attribute Key": "Attribute Value"
+      }}
+    }}
+  ]
+}}
+
+OR, if the description clearly contains multiple distinct products:
+
+{{
+  "results": [
+    {{
+      "row_id": 1,
+      "nested": true,
+      "canonical_similarity_score": 0.0,
+      "products": [
+        {{
+          "Product Type": "Product 1 type",
+          "Attribute Key": "Attribute Value"
+        }},
+        {{
+          "Product Type": "Product 2 type",
+          "Attribute Key": "Attribute Value"
+        }}
+      ]
+    }}
+  ]
+}}
+
+Return exactly one result object for each input item.
+Do not skip any item.
+Do not duplicate any item.
+Use the same row_id from the input.
+Return ONLY valid JSON.
+
+STEP 1 — INTERNAL ALIGNMENT (DO NOT OUTPUT)
+
+IMPORTANT FIRST RULE:
+Identify and Select the most specific and accurate product name for Product Type key based on the child-level description only to anchor all subsequent logic.
+
+PRODUCT TYPE RULE:
+Product Type should answer: "What is this item?"
+
+It must be a clean generic product type supported by the description, not a broad domain label.
+Avoid overly broad classes such as Pharmaceuticals, Food, Apparel, Machinery, or Consumer Goods when a more specific product type is present.
+
+Do NOT include brand names, flavors, sizes, dimensions, pack counts, quantities, weights, grades, model numbers, condition, origin, container/shipment details, or other commercial modifiers in "Product Type".
+
+Move those details into separate attribute keys such as Brand, Flavor, Variant, Dimensions, Packaging, Quantity, Net Weight, Model Number, Condition, Origin, or Container Type.
+
+ATTRIBUTE EXTRACTION:
+Extract only domain-relevant and technically meaningful attributes that are supported by the item description.
+
+If a specific value, measurement, count, material, model, grade, size, or technical detail exists in the description, assign it to the correct attribute key.
+Do not create a field unless the field name itself is supported by the description or is an unambiguous standard mapping.
+
+CHILD-ONLY RULE:
+Add attributes only when supported by explicit evidence in the item description.
+
+Do not invent specialized technical keys whose values would only be generic placeholders.
+
+ABBREVIATION HANDLING:
+Inspect abbreviations and short forms in the item description.
+
+Use the HS Code, Domain, and surrounding context to interpret abbreviations when the meaning is clear.
+
+If an abbreviation is ambiguous, do not force expansion. Preserve it as written under the most appropriate key, or omit it if it is not useful.
+
+Do not convert an abbreviation into a specialized technical claim unless the description clearly supports that meaning.
+
+LOGISTICS EXTRACTION:
+Look for unit multipliers, pack patterns, quantities, and shipment/logistics details such as "12 x 750ml", "129 BOX", "20 PKTS x 25 CTN", "36 PCS", "1x20 DRY CONTAINER".
+
+Map them to the correct keys such as Packaging, Pack Configuration, Quantity, Unit Volume, Dimensions, Container Type, or related logistics attributes.
+
+BRAND IDENTIFICATION:
+If a brand or commercial brand-like name is present in the item description, extract it into a separate "Brand" key.
+
+Do not include brand names inside "Product Type".
+
+Use the item description, HS Code, Domain, and trained knowledge of common brands to judge whether a token is likely to be a brand.
+
+Do not treat active ingredients, molecule names, chemical names, material names, or generic technical descriptors as Brand unless the description clearly indicates a commercial brand.
+
+If Brand is extracted, also output "Brand Confidence" using one of:
+"High", "Medium", "Low"
+
+- High = explicitly labeled as brand/make/manufacturer, or strongly recognized as a brand in context
+- Medium = likely brand based on naming pattern, token position, domain fit, and trained knowledge
+- Low = weak or uncertain brand-like signal
+
+If no clear brand is present, do not output Brand or Brand Confidence.
+
+HS CODE RESOLUTION:
+Only extract HS Code from the description when it is explicitly marked by cues like HS, HS CODE, HSN, HSNO, or similar. Do not infer HS codes from standalone numbers, quantities, invoice numbers, PO numbers, weights, or shipment counts.
+
+If one or more HS codes appear inside the item description, output at most one final "HS Code" and also "HS Code Confidence".
+
+If multiple HS-like codes appear, choose the single most likely code using:
+- proximity to the product name
+- consistency with the product type
+- consistency with the domain
+- preference for the most complete valid code when shorter forms are truncated duplicates or fragments
+
+If HS Code is extracted from the description, also output "HS Code Confidence" using one of:
+"High", "Medium", "Low"
+
+Never output multiple HS Code values.
+
+MULTI-PRODUCT RULE:
+If, after applying the Product Type rules, the item description resolves to one single "Product Type", return:
+- "nested": false
+
+Do not create nested output for closely related variants, flavors, sizes, strengths, pack configurations, dosage forms, specifications, line items, SKUs, or commercial sub-lines that still resolve to the same "Product Type".
+
+Return:
+- "nested": true
+- "canonical_similarity_score": 0 to 1
+- "products": [ ... ]
+
+only when the description clearly contains more than one distinct product family or commercially different product, where each product would reasonably stand as a separate item on its own.
+
+Each item inside "products" must be a separate flat JSON object with its own "Product Type" and related attributes.
+
+Each item inside "products" must independently follow all the same rules above, including internal alignment, Product Type rules, attribute extraction, abbreviation handling, brand identification, HS code resolution, category-aware generalization, and no redundancy, based only on the text relevant to that product.
+
+STRICT NESTED PRODUCT TYPE RULE:
+If "nested": true, the product objects inside "products" must represent clearly different product types or different product families.
+
+Do not return nested output when the product objects would have the same "Product Type" or effectively the same product family with only differences in model number, size, width, strength, packaging, quantity, or other technical/commercial variants.
+
+In such cases, return:
+- "nested": false
+
+and merge the differing values into arrays under the same attribute keys.
+
+Do not merge clearly different product families into one Product Type.
+Do not output multiple Product Type values in a single flat object unless "nested": true.
+
+If nested is true, "canonical_similarity_score" must be a number between 0 and 1 that represents how closely the nested products belong to the same broader commercial grouping:
+- closer to 1 = more closely related
+- closer to 0 = more commercially different
+
+If nested is false, do not output canonical_similarity_score.
+
+When uncertain, prefer "nested": false unless the description clearly supports separate commercially distinct products.
+
+CATEGORY-AWARE GENERALIZATION:
+If a broad commercial or logistics attribute is useful but its exact value is not present in the item description, you may use a safe placeholder adapted to the domain.
+
+Examples of safe placeholders:
+- "Standard Grade (Refer to Product Label or Certificate of Analysis)"
+- "Refer to Product Label or Manufacturer Website"
+- "Standard Industrial Specification (Refer to Datasheet/Manual)"
+- "Standard Industrial Size (Refer to Technical Drawing/Packaging)"
+- "Calculated at Time of Shipping / As per Invoice"
+- "Refer to Shipping Documents/Bill of Lading"
+
+Use such placeholders only for broad commercial/logistics attributes like Grade, Packaging, Quantity, Weight, Ingredients, Manufacturer, or similar.
+
+Do NOT use placeholders to invent specialized unsupported technical fields.
+
+NO REDUNDANCY:
+If an attribute value is identical to "Product Type", do not repeat it in another key.
+
+STEP 2 — STRUCTURE
+
+Output a SINGLE JSON object with key "results".
+
+For each result:
+- If single product:
+  - return "row_id"
+  - return "nested": false
+  - return "Product Type"
+  - return "Attributes"
+- If multiple products:
+  - return "row_id"
+  - return "nested": true
+  - return "products"
+  - return "canonical_similarity_score"
+
+For single-product results:
+- "Attributes" must be a flat JSON object.
+- Do not include "Product Type" again inside "Attributes".
+
+For multi-product results:
+- "products" must be an array of flat JSON objects.
+- Each product object must include its own "Product Type".
+
+All list-type values must be standard JSON arrays: ["Value 1", "Value 2"].
+
+Do not output empty arrays, empty strings, nulls, or "N/A".
+
+INPUT JSON:
+{items_json}
+
+FINAL JSON:"""
+
+
+# ============================================================
+# HS DOMAIN MAPPING
+# ============================================================
+
+HS_MAPPING = {
+    "01-05": "Live Animals",
+    "06-14": "Vegetable Products",
+    "15": "Animal, Vegetable Or Microbial Fats And Oils And Their Cleavage Products; Prepared Edible Fats; Animal Or Vegetable Waxes",
+    "16-24": "Prepared Foodstuffs; Beverages, Spirits And Vinegar; Tobacco And Manufactured Tobacco Substitutes",
+    "25-27": "Mineral Products",
+    "28-38": "Products Of The Chemical Or Allied Industries",
+    "39-40": "Plastics And Articles Thereof; Rubber And Articles Thereof",
+    "41-43": "Raw Hides And Skins, Leather, Furskins; Articles Of Animal Gut",
+    "44-46": "Wood And Articles Of Wood; Cork; Basketware and Wickerwork",
+    "47-49": "Pulp Of Wood; Recovered Paper; Paper and Paperboard Articles",
+    "50-63": "Textile And Textile Articles",
+    "64-67": "Footwear, Headgear, Artificial Flowers; Articles Of Human Hair",
+    "68-70": "Articles Of Stone, Plaster, Cement, Asbestos, Mica; Glass And Glassware",
+    "71": "Natural Or Cultured Pearls, Precious Metals, and Articles Thereof; Imitation Jewellery",
+    "72-83": "Base Metals And Articles Of Base Metal",
+    "84-85": "Machinery And Mechanical Appliances; Electrical Equipment; Sound and TV Recorders",
+    "86-89": "Vehicles, Aircraft, Vessels And Associated Transport Equipment",
+    "90-92": "Optical, Medical Or Surgical Instruments; Clocks; Musical Instruments",
+    "93": "Arms And Ammunition; Parts And Accessories Thereof",
+    "94-96": "Miscellaneous Manufactured Articles",
+    "97": "Works Of Art, Collectors' Pieces And Antiques",
+}
+
+
+# ============================================================
+# DATA STRUCTURES
+# ============================================================
+
+class FinalStatus(str, Enum):
+    SUCCESS = "success"
+    LOW_ATTRIBUTE = "low_attribute"
+    MODEL_ERROR = "model_error"
+    SERVER_FAILED = "server_failed"
+    SERVER_FAILED_OOM = "server_failed_oom"
+    TRUNCATED = "truncated"
+
+
+class BatchOutcome(str, Enum):
+    SUCCESS = "success"
+    PARTIAL_MODEL_ERROR = "partial_model_error"
+    SERVER_FAILED = "server_failed"
+    SERVER_FAILED_OOM = "server_failed_oom"
+
+
+@dataclass(frozen=True)
+class InputRow:
+    row_id: int
+    record_uuid: str
+    hs_code: str
+    product_description: str
+
+
+@dataclass
+class BatchResult:
+    batch_id: int
+    rows: List[InputRow]
+    outcome: BatchOutcome
+    success_rows: List[Dict]
+    low_attribute_rows: List[Dict]
+    error_rows: List[Dict]
+    server_failed_rows: List[Dict]
+    status_rows: List[Dict]
+    metric_row: Dict
+    raw_model_output: str = ""
+    server_error_type: str = ""
+
+
+@dataclass
+class Config:
+    input_file: str
+    output_dir: str
+    base_url: str
+    metrics_url: str
+    api_key: str
+    model_name: str
+    batch_size: int
+    normal_workers: int
+    backpressure_workers: int
+    max_tokens: int
+    graceful_shutdown_wait_seconds: int
+    request_timeout_seconds: int
+    server_max_attempts: int
+    backoff_seconds: List[int]
+    max_consecutive_server_failures: int
+    metrics_poll_seconds: int
+    backpressure_duration_seconds: int
+    kv_immediate_backpressure: float
+    kv_streak_backpressure: float
+    kv_streak_checks: int
+    kv_exit_streak_checks: int
+    kv_exit_backpressure: float
+    waiting_high: int
+    waiting_high_streak_checks: int
+    chunksize: int
+    max_records: Optional[int]
+    clear_existing_outputs: bool
+    hs_code_column: str
+    description_column: str
+    uuid_column: str
+    use_sqlite_status: bool
+    status_db_filename: str
+    migrate_master_status_to_sqlite: bool
+
+
+# ============================================================
+# GENERAL HELPERS
+# ============================================================
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def normalize_text(value) -> str:
+    if pd.isna(value):
+        return ""
+    return re.sub(r"\s+", " ", str(value).strip())
+
+
+def get_domain(hs_code: str) -> str:
+    try:
+        hs_int = int(str(hs_code).strip().zfill(4)[:2])
+        for key, value in HS_MAPPING.items():
+            if "-" in key:
+                lo, hi = map(int, key.split("-"))
+                if lo <= hs_int <= hi:
+                    return value
+            elif int(key) == hs_int:
+                return value
+    except Exception:
+        pass
+    return "General Trade Goods"
+
+
+def ensure_dir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
+
+
+def is_oom_text(text: str) -> bool:
+    lower = str(text).lower()
+    return any(
+        token in lower
+        for token in [
+            "cuda out of memory",
+            "torch.outofmemoryerror",
+            "outofmemoryerror",
+            "out of memory",
+            "oom",
+        ]
+    )
+
+
+def looks_truncated(text: str) -> bool:
+    cleaned = str(text).strip()
+    if not cleaned:
+        return False
+    if is_oom_text(cleaned):
+        return False
+    # Common case: JSON starts but never closes.
+    return cleaned.count("{") > cleaned.count("}") or cleaned.count("[") > cleaned.count("]")
+
+
+# ============================================================
+# CSV FIELDNAMES
+# ============================================================
+
+OUTPUT_FIELDNAMES = [
+    "row_id",
+    "record_uuid",
+    "hs_code",
+    "product_description",
+    "product_type",
+    "attributes",
+]
+
+ERROR_FIELDNAMES = [
+    "row_id",
+    "record_uuid",
+    "batch_id",
+    "hs_code",
+    "product_description",
+    "error_type",
+    "error",
+    "raw_model_output",
+]
+
+SERVER_FAILED_FIELDNAMES = [
+    "row_id",
+    "record_uuid",
+    "batch_id",
+    "hs_code",
+    "product_description",
+    "error_type",
+    "error",
+]
+
+STATUS_FIELDNAMES = [
+    "row_id",
+    "record_uuid",
+    "batch_id",
+    "hs_code",
+    "product_description",
+    "status",
+    "output_file",
+    "error_type",
+    "attempt_count",
+    "updated_at_utc",
+]
+
+METRIC_FIELDNAMES = [
+    "batch_id",
+    "rows_in_batch",
+    "row_ids",
+    "status",
+    "mode",
+    "attempts_used",
+    "error_type",
+    "error",
+    "start_ts_utc",
+    "end_ts_utc",
+    "request_duration_sec",
+    "rows_per_sec",
+    "prompt_tokens_api",
+    "completion_tokens_api",
+    "total_tokens_api",
+    "prefix_queries_delta",
+    "prefix_hits_delta",
+    "prefix_misses_delta",
+    "prefix_hit_rate_delta",
+    "kv_cache_usage_before",
+    "kv_cache_usage_after",
+    "running_requests_before",
+    "running_requests_after",
+    "waiting_requests_before",
+    "waiting_requests_after",
+]
+
+
+# ============================================================
+# OUTPUT WRITER
+# ============================================================
+
+class OutputWriter:
+    def __init__(
+        self,
+        output_dir: str,
+        clear_existing: bool = False,
+        use_sqlite_status: bool = True,
+        status_db_filename: str = "status.db",
+        migrate_master_status_to_sqlite: bool = True,
+    ) -> None:
+        ensure_dir(output_dir)
+        self.output_dir = output_dir
+        self.files = {
+            "success": os.path.join(output_dir, "success_output.csv"),
+            "low_attribute": os.path.join(output_dir, "low_attribute_output.csv"),
+            "error": os.path.join(output_dir, "error_output.csv"),
+            "server_failed": os.path.join(output_dir, "server_failed_output.csv"),
+            "server_failed_oom": os.path.join(output_dir, "server_failed_oom_output.csv"),
+            "master_status": os.path.join(output_dir, "master_status.csv"),
+            "metrics": os.path.join(output_dir, "metrics.csv"),
+            "status_db": os.path.join(output_dir, status_db_filename),
+        }
+        self.lock = threading.Lock()
+        if clear_existing:
+            for key, path in self.files.items():
+                if key == "status_db":
+                    for db_path in [path, path + "-wal", path + "-shm"]:
+                        if os.path.exists(db_path):
+                            os.remove(db_path)
+                elif os.path.exists(path):
+                    os.remove(path)
+
+        self.status_store: Optional[StatusStore] = None
+        if use_sqlite_status:
+            self.status_store = StatusStore(
+                db_path=self.files["status_db"],
+                master_status_path=self.files["master_status"],
+                migrate_from_master_status=migrate_master_status_to_sqlite,
+            )
+
+    def close(self) -> None:
+        if self.status_store is not None:
+            self.status_store.close()
+
+    def _append_rows_locked(self, file_key: str, rows: List[Dict], fieldnames: List[str]) -> None:
+        """Same as append_rows but assumes self.lock is already held by the caller."""
+        if not rows:
+            return
+        path = self.files[file_key]
+        file_exists = os.path.exists(path) and os.path.getsize(path) > 0
+        with open(path, "a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+            if not file_exists:
+                writer.writeheader()
+            for row in rows:
+                writer.writerow(row)
+            f.flush()
+            os.fsync(f.fileno())
+
+    def append_rows(self, file_key: str, rows: List[Dict], fieldnames: List[str]) -> None:
+        with self.lock:
+            self._append_rows_locked(file_key, rows, fieldnames)
+
+    def write_batch_result(self, result: BatchResult) -> None:
+        # Batch-level commit is preserved. Output CSVs are written first. Then
+        # status.db is updated, then master_status.csv is appended for audit, and
+        # metrics.csv is written. If a crash happens before status.db update,
+        # rows may be retried; if it happens after status.db update, output rows
+        # already exist and resume will skip them.
+        with self.lock:
+            self._append_rows_locked("success", result.success_rows, OUTPUT_FIELDNAMES)
+            self._append_rows_locked("low_attribute", result.low_attribute_rows, OUTPUT_FIELDNAMES)
+            self._append_rows_locked("error", result.error_rows, ERROR_FIELDNAMES)
+            if result.outcome == BatchOutcome.SERVER_FAILED_OOM:
+                self._append_rows_locked("server_failed_oom", result.server_failed_rows, SERVER_FAILED_FIELDNAMES)
+            else:
+                self._append_rows_locked("server_failed", result.server_failed_rows, SERVER_FAILED_FIELDNAMES)
+            if self.status_store is not None:
+                self.status_store.upsert_status_rows(result.status_rows)
+            self._append_rows_locked("master_status", result.status_rows, STATUS_FIELDNAMES)
+            self._append_rows_locked("metrics", [result.metric_row], METRIC_FIELDNAMES)
+
+    def write_oom_rows(self, rows: List[InputRow], batch_id: int, error: str, attempts: int) -> None:
+        failed_rows = []
+        status_rows = []
+        now = utc_now_iso()
+        for row in rows:
+            failed_rows.append(
+                {
+                    "row_id": row.row_id,
+                    "record_uuid": row.record_uuid,
+                    "batch_id": batch_id,
+                    "hs_code": row.hs_code,
+                    "product_description": row.product_description,
+                    "error_type": "server_failed_oom",
+                    "error": error,
+                }
+            )
+            status_rows.append(
+                {
+                    "row_id": row.row_id,
+                    "record_uuid": row.record_uuid,
+                    "batch_id": batch_id,
+                    "hs_code": row.hs_code,
+                    "product_description": row.product_description,
+                    "status": FinalStatus.SERVER_FAILED_OOM.value,
+                    "output_file": "server_failed_oom_output.csv",
+                    "error_type": "server_failed_oom",
+                    "attempt_count": attempts,
+                    "updated_at_utc": now,
+                }
+            )
+        with self.lock:
+            self._append_rows_locked("server_failed_oom", failed_rows, SERVER_FAILED_FIELDNAMES)
+            if self.status_store is not None:
+                self.status_store.upsert_status_rows(status_rows)
+            self._append_rows_locked("master_status", status_rows, STATUS_FIELDNAMES)
+
+
+# ============================================================
+# RESUME / STATUS
+# ============================================================
+
+class StatusStore:
+    """SQLite-backed completed-status ledger used for scalable resume.
+
+    The input CSV remains the source of all rows. This DB stores only rows that
+    have reached a final status after a batch-level commit.
+    """
+
+    def __init__(self, db_path: str, master_status_path: str, migrate_from_master_status: bool = True) -> None:
+        self.db_path = db_path
+        self.master_status_path = master_status_path
+        self.lock = threading.Lock()
+        ensure_dir(os.path.dirname(db_path))
+        db_existed = os.path.exists(db_path) and os.path.getsize(db_path) > 0
+        self.conn = sqlite3.connect(db_path, timeout=30, check_same_thread=False)
+        self._configure_connection()
+        self._create_schema()
+        if migrate_from_master_status and (not db_existed) and os.path.exists(master_status_path):
+            self.migrate_master_status_csv(master_status_path)
+
+    def _configure_connection(self) -> None:
+        with self.lock:
+            self.conn.execute("PRAGMA journal_mode=WAL;")
+            self.conn.execute("PRAGMA synchronous=NORMAL;")
+            self.conn.execute("PRAGMA temp_store=MEMORY;")
+            self.conn.execute("PRAGMA cache_size=-200000;")
+            self.conn.execute("PRAGMA busy_timeout=30000;")
+
+    def _create_schema(self) -> None:
+        with self.lock:
+            self.conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS status (
+                    record_uuid TEXT PRIMARY KEY,
+                    row_id INTEGER,
+                    batch_id INTEGER,
+                    hs_code TEXT,
+                    product_description TEXT,
+                    status TEXT,
+                    output_file TEXT,
+                    error_type TEXT,
+                    attempt_count INTEGER,
+                    updated_at_utc TEXT
+                )
+                """
+            )
+            columns = {row[1]: row for row in self.conn.execute("PRAGMA table_info(status)").fetchall()}
+            if "record_uuid" not in columns:
+                raise RuntimeError(
+                    "Existing status DB uses the old hash-based schema and does not contain record_uuid. "
+                    "Use a fresh OUTPUT_DIR or a fresh STATUS_DB_FILENAME for the UUID-based runner."
+                )
+            if int(columns["record_uuid"][5]) != 1:
+                raise RuntimeError(
+                    "Existing status DB does not use record_uuid as the primary key. "
+                    "Use a fresh OUTPUT_DIR or a fresh STATUS_DB_FILENAME for the UUID-based runner."
+                )
+            self.conn.execute("CREATE INDEX IF NOT EXISTS idx_status_row_id ON status(row_id)")
+            self.conn.execute("CREATE INDEX IF NOT EXISTS idx_status_status ON status(status)")
+            self.conn.commit()
+
+    def close(self) -> None:
+        with self.lock:
+            self.conn.commit()
+            self.conn.close()
+
+    def count_completed(self) -> int:
+        """Count rows with final/skippable statuses only.
+
+        server_failed/server_failed_oom rows are intentionally not counted as
+        completed for resume because they should be retried on the next run.
+        """
+        final_statuses = (
+            FinalStatus.SUCCESS.value,
+            FinalStatus.LOW_ATTRIBUTE.value,
+            FinalStatus.MODEL_ERROR.value,
+            FinalStatus.TRUNCATED.value,
+        )
+        placeholders = ",".join("?" for _ in final_statuses)
+        with self.lock:
+            row = self.conn.execute(
+                f"SELECT COUNT(*) FROM status WHERE status IN ({placeholders})",
+                final_statuses,
+            ).fetchone()
+        return int(row[0] if row else 0)
+
+    def get_completed_uuids(self, record_uuids: List[str]) -> Set[str]:
+        """Return UUIDs from record_uuids that already have final/skippable status.
+
+        Server failure statuses are intentionally not returned, so those rows
+        are retried instead of being skipped forever. Queries are split to stay
+        below SQLite parameter limits.
+        """
+        cleaned = [u for u in record_uuids if u]
+        if not cleaned:
+            return set()
+
+        final_statuses = (
+            FinalStatus.SUCCESS.value,
+            FinalStatus.LOW_ATTRIBUTE.value,
+            FinalStatus.MODEL_ERROR.value,
+            FinalStatus.TRUNCATED.value,
+        )
+        found: Set[str] = set()
+        with self.lock:
+            for start in range(0, len(cleaned), 800):
+                part = cleaned[start:start + 800]
+                uuid_placeholders = ",".join("?" for _ in part)
+                status_placeholders = ",".join("?" for _ in final_statuses)
+                query = f"""
+                    SELECT record_uuid
+                    FROM status
+                    WHERE record_uuid IN ({uuid_placeholders})
+                      AND status IN ({status_placeholders})
+                """
+                params = list(part) + list(final_statuses)
+                found.update(row[0] for row in self.conn.execute(query, params).fetchall())
+        return found
+
+    def upsert_status_rows(self, rows: List[Dict]) -> None:
+        if not rows:
+            return
+        payload = [
+            (
+                normalize_text(row.get("record_uuid", "")),
+                int(row.get("row_id", 0) or 0),
+                int(row.get("batch_id", 0) or 0),
+                normalize_text(row.get("hs_code", "")),
+                normalize_text(row.get("product_description", "")),
+                normalize_text(row.get("status", "")),
+                normalize_text(row.get("output_file", "")),
+                normalize_text(row.get("error_type", "")),
+                int(row.get("attempt_count", 0) or 0),
+                normalize_text(row.get("updated_at_utc", "")),
+            )
+            for row in rows
+            if normalize_text(row.get("record_uuid", ""))
+        ]
+        if not payload:
+            return
+        with self.lock:
+            self.conn.executemany(
+                """
+                INSERT INTO status (
+                    record_uuid, row_id, batch_id, hs_code, product_description,
+                    status, output_file, error_type, attempt_count, updated_at_utc
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(record_uuid) DO UPDATE SET
+                    row_id=excluded.row_id,
+                    batch_id=excluded.batch_id,
+                    hs_code=excluded.hs_code,
+                    product_description=excluded.product_description,
+                    status=excluded.status,
+                    output_file=excluded.output_file,
+                    error_type=excluded.error_type,
+                    attempt_count=excluded.attempt_count,
+                    updated_at_utc=excluded.updated_at_utc
+                """,
+                payload,
+            )
+            self.conn.commit()
+
+    def migrate_master_status_csv(self, master_status_path: str) -> None:
+        """One-time migration from existing master_status.csv into status.db."""
+        if not os.path.exists(master_status_path):
+            return
+        print(f"Migrating existing master_status.csv into SQLite status DB: {self.db_path}")
+        batch: List[Dict] = []
+        migrated = 0
+        with open(master_status_path, "r", newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if normalize_text(row.get("record_uuid", "")):
+                    batch.append(row)
+                if len(batch) >= 5000:
+                    self.upsert_status_rows(batch)
+                    migrated += len(batch)
+                    batch = []
+            if batch:
+                self.upsert_status_rows(batch)
+                migrated += len(batch)
+        print(f"SQLite migration complete. Migrated/updated status rows: {migrated}")
+
+
+def load_completed_uuids(master_status_path: str) -> Dict[str, str]:
+    """CSV fallback: Return record_uuid -> final_status from master_status.csv.
+
+    The SQLite backend avoids this full-file load. This function remains only as
+    rollback fallback when USE_SQLITE_STATUS = False.
+    """
+    completed: Dict[str, str] = {}
+    if not os.path.exists(master_status_path):
+        return completed
+    with open(master_status_path, "r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            record_uuid = normalize_text(row.get("record_uuid", ""))
+            status = normalize_text(row.get("status", ""))
+            if record_uuid and status:
+                completed[record_uuid] = status
+    return completed
+
+
+# ============================================================
+# INPUT GENERATOR
+# ============================================================
+
+def detect_columns(
+    df: pd.DataFrame,
+    hs_code_column: str,
+    description_column: str,
+    uuid_column: str,
+) -> Tuple[str, str, str]:
+    cols = list(df.columns)
+    normalized = {c.lower().strip(): c for c in cols}
+
+    def resolve_configured(configured: str, label: str) -> Optional[str]:
+        if not configured:
+            return None
+        if configured in cols:
+            return configured
+        key = configured.lower().strip()
+        if key in normalized:
+            return normalized[key]
+        raise ValueError(f"Configured {label} column not found: {configured}. Available columns: {cols}")
+
+    hs_col = resolve_configured(hs_code_column, "HS code")
+    desc_col = resolve_configured(description_column, "description")
+    uuid_col = resolve_configured(uuid_column, "UUID")
+
+    hs_candidates = ["hs_code", "hscode", "hs code", "hs", "itc_hs_code", "hsn", "hsn_code", "hsn code"]
+    desc_candidates = [
+        "product_description",
+        "product description",
+        "description",
+        "item_description",
+        "item description",
+        "product_desc",
+        "goods_description",
+        "goods description",
+        "product desc",
+    ]
+    uuid_candidates = ["uuid", "record_uuid", "record uuid", "row_uuid", "row uuid", "id", "record_id", "record id"]
+
+    if hs_col is None:
+        hs_col = next((normalized[c] for c in hs_candidates if c in normalized), None)
+    if desc_col is None:
+        desc_col = next((normalized[c] for c in desc_candidates if c in normalized), None)
+    if uuid_col is None:
+        uuid_col = next((normalized[c] for c in uuid_candidates if c in normalized), None)
+
+    missing = []
+    if hs_col is None:
+        missing.append("hs_code")
+    if desc_col is None:
+        missing.append("product_description")
+    if uuid_col is None:
+        missing.append("UUID")
+    if missing:
+        raise ValueError(
+            f"Could not auto-detect required column(s): {missing}. "
+            f"Available columns: {cols}. Configure HS_CODE_COLUMN, DESCRIPTION_COLUMN, and UUID_COLUMN if needed."
+        )
+
+    return hs_col, desc_col, uuid_col
+
+
+def iter_input_chunks(input_file: str, chunksize: int) -> Iterator[pd.DataFrame]:
+    lower = input_file.lower()
+    if lower.endswith(".csv"):
+        yield from pd.read_csv(input_file, chunksize=chunksize)
+        return
+    if lower.endswith((".xlsx", ".xls")):
+        raise NotImplementedError(
+            "Excel input is disabled for production runs because pandas read_excel() "
+            "loads the entire file into RAM and does not provide true chunksize streaming. "
+            "Convert the input to .csv and set INPUT_FILE to the .csv path."
+        )
+    raise ValueError(f"Unsupported input file format: {input_file}. Use .csv for production runs.")
+
+
+def count_valid_csv_rows_for_max_records(
+    input_file: str,
+    chunksize: int,
+    hs_code_column: str,
+    description_column: str,
+    uuid_column: str,
+) -> int:
+    """Count valid processable CSV rows for AUTO MAX_RECORDS.
+
+    A valid row has a non-empty product description and a non-empty UUID.
+    This count is used only to avoid manually editing MAX_RECORDS for each file.
+    """
+    if not os.path.exists(input_file):
+        raise FileNotFoundError(f"Input file not found: {input_file}")
+
+    total = 0
+    row_id = 0
+    hs_col: Optional[str] = None
+    desc_col: Optional[str] = None
+    uuid_col: Optional[str] = None
+
+    for chunk in iter_input_chunks(input_file, chunksize):
+        if hs_col is None or desc_col is None or uuid_col is None:
+            hs_col, desc_col, uuid_col = detect_columns(
+                chunk,
+                hs_code_column,
+                description_column,
+                uuid_column,
+            )
+
+        for _, raw_row in chunk.iterrows():
+            row_id += 1
+            product_description = normalize_text(raw_row.get(desc_col, ""))
+            record_uuid = normalize_text(raw_row.get(uuid_col, ""))
+            if not product_description:
+                continue
+            if not record_uuid:
+                raise ValueError(f"Missing UUID at input row_id={row_id}. UUID is required for safe resume.")
+            total += 1
+
+    return total
+
+def input_row_generator(
+    config: Config,
+    completed_uuids: Optional[Dict[str, str]] = None,
+    status_store: Optional[StatusStore] = None,
+) -> Iterator[InputRow]:
+    if not os.path.exists(config.input_file):
+        raise FileNotFoundError(f"Input file not found: {config.input_file}")
+
+    completed_uuids = completed_uuids or {}
+    row_id = 0
+    yielded = 0
+    hs_col: Optional[str] = None
+    desc_col: Optional[str] = None
+    uuid_col: Optional[str] = None
+
+    for chunk in iter_input_chunks(config.input_file, config.chunksize):
+        if hs_col is None or desc_col is None or uuid_col is None:
+            hs_col, desc_col, uuid_col = detect_columns(
+                chunk,
+                config.hs_code_column,
+                config.description_column,
+                config.uuid_column,
+            )
+            print(f"Detected HS code column: {hs_col}")
+            print(f"Detected description column: {desc_col}")
+            print(f"Detected UUID column: {uuid_col}")
+
+        prepared_rows: List[InputRow] = []
+        for _, raw_row in chunk.iterrows():
+            row_id += 1
+            hs_code = normalize_text(raw_row.get(hs_col, ""))
+            product_description = normalize_text(raw_row.get(desc_col, ""))
+            record_uuid = normalize_text(raw_row.get(uuid_col, ""))
+            if not product_description:
+                continue
+            if not record_uuid:
+                raise ValueError(f"Missing UUID at input row_id={row_id}. UUID is required for safe resume.")
+
+            prepared_rows.append(
+                InputRow(
+                    row_id=row_id,
+                    record_uuid=record_uuid,
+                    hs_code=hs_code,
+                    product_description=product_description,
+                )
+            )
+
+        if status_store is not None:
+            completed_in_chunk = status_store.get_completed_uuids([row.record_uuid for row in prepared_rows])
+        else:
+            completed_in_chunk = set(completed_uuids.keys())
+
+        for row in prepared_rows:
+            if row.record_uuid in completed_in_chunk:
+                continue
+            yield row
+            yielded += 1
+            if config.max_records is not None and yielded >= config.max_records:
+                return
+
+def batch_generator(rows: Iterator[InputRow], batch_size: int) -> Iterator[List[InputRow]]:
+    batch: List[InputRow] = []
+    for row in rows:
+        batch.append(row)
+        if len(batch) >= batch_size:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
+
+
+def format_elapsed(seconds: float) -> str:
+    seconds_int = int(max(seconds, 0))
+    hours = seconds_int // 3600
+    minutes = (seconds_int % 3600) // 60
+    secs = seconds_int % 60
+    if hours > 0:
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
+def count_workload(
+    config: Config,
+    completed_uuids: Optional[Dict[str, str]] = None,
+    status_store: Optional[StatusStore] = None,
+) -> Tuple[int, int, int]:
+    """Count valid rows, already completed rows, and pending rows for the run.
+
+    With SQLite enabled, this scans input chunk-by-chunk and asks status.db only
+    about UUIDs in the current chunk, avoiding a giant completed-UUID dict.
+    """
+    if not os.path.exists(config.input_file):
+        raise FileNotFoundError(f"Input file not found: {config.input_file}")
+
+    completed_uuids = completed_uuids or {}
+    total_valid_rows = 0
+    already_completed_rows = 0
+    pending_rows = 0
+    row_id = 0
+    hs_col: Optional[str] = None
+    desc_col: Optional[str] = None
+    uuid_col: Optional[str] = None
+
+    for chunk in iter_input_chunks(config.input_file, config.chunksize):
+        if hs_col is None or desc_col is None or uuid_col is None:
+            hs_col, desc_col, uuid_col = detect_columns(
+                chunk,
+                config.hs_code_column,
+                config.description_column,
+                config.uuid_column,
+            )
+
+        prepared: List[Tuple[str, str, str]] = []
+        for _, raw_row in chunk.iterrows():
+            row_id += 1
+            hs_code = normalize_text(raw_row.get(hs_col, ""))
+            product_description = normalize_text(raw_row.get(desc_col, ""))
+            record_uuid = normalize_text(raw_row.get(uuid_col, ""))
+            if not product_description:
+                continue
+            if not record_uuid:
+                raise ValueError(f"Missing UUID at input row_id={row_id}. UUID is required for safe resume.")
+            prepared.append((record_uuid, hs_code, product_description))
+
+        if status_store is not None:
+            completed_in_chunk = status_store.get_completed_uuids([x[0] for x in prepared])
+        else:
+            completed_in_chunk = set(completed_uuids.keys())
+
+        for record_uuid, _, _ in prepared:
+            total_valid_rows += 1
+            if record_uuid in completed_in_chunk:
+                already_completed_rows += 1
+                continue
+            pending_rows += 1
+            if config.max_records is not None and pending_rows >= config.max_records:
+                return total_valid_rows, already_completed_rows, pending_rows
+
+    return total_valid_rows, already_completed_rows, pending_rows
+
+
+# ============================================================
+# VLLM METRICS / BACKPRESSURE
+# ============================================================
+
+def parse_prometheus_metrics(text: str) -> Dict[str, float]:
+    metrics: Dict[str, float] = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        try:
+            metric_part, value_part = line.rsplit(" ", 1)
+            metric_name = metric_part.split("{", 1)[0].strip()
+            value = float(value_part.strip())
+            metrics[metric_name] = metrics.get(metric_name, 0.0) + value
+        except Exception:
+            continue
+    return metrics
+
+
+def get_metric(metrics: Dict[str, float], names: List[str], default=0.0):
+    for name in names:
+        if name in metrics:
+            return metrics[name]
+    return default
+
+
+def get_vllm_metrics_snapshot(metrics_url: str) -> Dict[str, float]:
+    try:
+        response = requests.get(metrics_url, timeout=5)
+        if response.status_code != 200:
+            return {}
+        metrics = parse_prometheus_metrics(response.text)
+        prefix_queries = get_metric(metrics, ["vllm:prefix_cache_queries_total", "vllm:prefix_cache_queries"], 0.0)
+        prefix_hits = get_metric(metrics, ["vllm:prefix_cache_hits_total", "vllm:prefix_cache_hits"], 0.0)
+        kv_cache_usage = get_metric(metrics, ["vllm:kv_cache_usage_perc", "vllm:gpu_cache_usage_perc"], 0.0)
+        running_requests = get_metric(metrics, ["vllm:num_requests_running"], 0.0)
+        waiting_requests = get_metric(metrics, ["vllm:num_requests_waiting"], 0.0)
+        prefix_misses = max(prefix_queries - prefix_hits, 0.0)
+        return {
+            "prefix_queries": prefix_queries,
+            "prefix_hits": prefix_hits,
+            "prefix_misses": prefix_misses,
+            "kv_cache_usage": kv_cache_usage,
+            "running_requests": running_requests,
+            "waiting_requests": waiting_requests,
+        }
+    except Exception:
+        return {}
+
+
+def build_vllm_metrics_delta(before: Dict, after: Dict) -> Dict:
+    prefix_queries_delta = after.get("prefix_queries", 0.0) - before.get("prefix_queries", 0.0)
+    prefix_hits_delta = after.get("prefix_hits", 0.0) - before.get("prefix_hits", 0.0)
+    prefix_misses_delta = after.get("prefix_misses", 0.0) - before.get("prefix_misses", 0.0)
+    if prefix_misses_delta < 0:
+        prefix_misses_delta = ""
+    if prefix_queries_delta > 0:
+        prefix_hit_rate_delta = round(prefix_hits_delta / prefix_queries_delta, 4)
+    else:
+        prefix_hit_rate_delta = ""
+    return {
+        "prefix_queries_delta": prefix_queries_delta,
+        "prefix_hits_delta": prefix_hits_delta,
+        "prefix_misses_delta": prefix_misses_delta,
+        "prefix_hit_rate_delta": prefix_hit_rate_delta,
+        "kv_cache_usage_before": before.get("kv_cache_usage", ""),
+        "kv_cache_usage_after": after.get("kv_cache_usage", ""),
+        "running_requests_before": before.get("running_requests", ""),
+        "running_requests_after": after.get("running_requests", ""),
+        "waiting_requests_before": before.get("waiting_requests", ""),
+        "waiting_requests_after": after.get("waiting_requests", ""),
+    }
+
+
+class BackpressureMonitor:
+    def __init__(self, config: Config) -> None:
+        self.config = config
+        self.mode = "normal"
+        self.backpressure_until = 0.0
+        self.kv_high_streak = 0
+        self.kv_exit_streak = 0
+        self.waiting_high_streak = 0
+        self.recent_server_error_count = 0
+        self.last_poll = 0.0
+        self.last_snapshot: Dict[str, float] = {}
+        self.consecutive_metrics_failures = 0
+        self.lock = threading.Lock()
+
+    def record_server_error(self) -> None:
+        with self.lock:
+            self.recent_server_error_count += 1
+
+    def record_success(self) -> None:
+        with self.lock:
+            self.recent_server_error_count = 0
+
+    def poll_if_needed(self) -> None:
+        now = time.time()
+        with self.lock:
+            if now - self.last_poll < self.config.metrics_poll_seconds:
+                return
+            self.last_poll = now
+
+        snapshot = get_vllm_metrics_snapshot(self.config.metrics_url)
+
+        if not snapshot:
+            with self.lock:
+                self.consecutive_metrics_failures += 1
+                failures = self.consecutive_metrics_failures
+            # Metrics-based backpressure is blind while this is happening (kv/waiting
+            # default to 0, so kv/waiting-based triggers cannot fire). Surface this
+            # periodically rather than only once at startup, so a metrics outage
+            # mid-run doesn't silently disable the safety mechanism.
+            if failures == 1 or failures % 10 == 0:
+                print(
+                    f"WARNING: vLLM metrics unreachable at {self.config.metrics_url} "
+                    f"({failures} consecutive failed polls). KV/waiting-based backpressure "
+                    f"is not active; only server-error-based abort logic is protecting the run."
+                )
+            return
+
+        with self.lock:
+            self.consecutive_metrics_failures = 0
+
+        kv = float(snapshot.get("kv_cache_usage", 0.0) or 0.0)
+        waiting = float(snapshot.get("waiting_requests", 0.0) or 0.0)
+
+        with self.lock:
+            self.last_snapshot = snapshot
+
+            if kv >= self.config.kv_streak_backpressure:
+                self.kv_high_streak += 1
+            else:
+                self.kv_high_streak = 0
+
+            # Exit streak: counts consecutive polls where kv is already below the
+            # exit threshold, independent of mode, so it's "warmed up" by the time
+            # the minimum hold (backpressure_until) elapses instead of starting
+            # from zero at that moment.
+            if kv < self.config.kv_exit_backpressure:
+                self.kv_exit_streak += 1
+            else:
+                self.kv_exit_streak = 0
+
+            if waiting >= self.config.waiting_high:
+                self.waiting_high_streak += 1
+            else:
+                self.waiting_high_streak = 0
+
+            enter = (
+                kv >= self.config.kv_immediate_backpressure
+                or self.kv_high_streak >= self.config.kv_streak_checks
+                or self.waiting_high_streak >= self.config.waiting_high_streak_checks
+            )
+
+            if enter and self.mode != "backpressure":
+                self.mode = "backpressure"
+                self.backpressure_until = now + self.config.backpressure_duration_seconds
+                print(
+                    f"[BACKPRESSURE ENTER] kv={kv:.4f} waiting={waiting} "
+                    f"workers={self.config.backpressure_workers} duration_sec={self.config.backpressure_duration_seconds}"
+                )
+
+            if self.mode == "backpressure" and now >= self.backpressure_until:
+                no_recent_errors = self.recent_server_error_count == 0
+                exit_streak_ok = self.kv_exit_streak >= self.config.kv_exit_streak_checks
+                if exit_streak_ok and waiting == 0 and no_recent_errors:
+                    final_streak = self.kv_exit_streak
+                    self.mode = "normal"
+                    self.kv_high_streak = 0
+                    self.kv_exit_streak = 0
+                    self.waiting_high_streak = 0
+                    print(f"[BACKPRESSURE EXIT] kv={kv:.4f} waiting={waiting} exit_streak={final_streak}")
+                else:
+                    self.backpressure_until = now + self.config.backpressure_duration_seconds
+                    print(
+                        f"[BACKPRESSURE EXTEND] kv={kv:.4f} waiting={waiting} "
+                        f"exit_streak={self.kv_exit_streak}/{self.config.kv_exit_streak_checks} "
+                        f"recent_errors={self.recent_server_error_count}"
+                    )
+
+    def current_limits(self) -> Tuple[str, int]:
+        self.poll_if_needed()
+        with self.lock:
+            if self.mode == "backpressure":
+                workers = self.config.backpressure_workers
+            else:
+                workers = self.config.normal_workers
+        return self.mode, workers
+
+
+# ============================================================
+# MODEL CALL / VALIDATION
+# ============================================================
+
+def build_batch_prompt(batch_rows: List[InputRow]) -> str:
+    items = []
+    for row in batch_rows:
+        items.append(
+            {
+                "row_id": row.row_id,
+                "hs_code": row.hs_code,
+                "domain": get_domain(row.hs_code),
+                "product_description": row.product_description,
+            }
+        )
+    return PROMPT_TEMPLATE.format(items_json=json.dumps({"items": items}, ensure_ascii=False))
+
+
+def clean_json_text(text: str) -> str:
+    cleaned = str(text).strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+    return cleaned.strip()
+
+
+def extract_json_object(text: str) -> Dict:
+    cleaned = clean_json_text(text)
+    try:
+        parsed = json.loads(cleaned)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        pass
+
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        raise ValueError("No JSON object found in model output")
+    parsed = json.loads(cleaned[start:end + 1])
+    if not isinstance(parsed, dict):
+        raise ValueError("Parsed output is not a JSON object")
+    return parsed
+
+
+def normalize_product_type(value) -> str:
+    if isinstance(value, list):
+        value = ", ".join(str(x) for x in value)
+    return normalize_text(value)
+
+
+def normalize_attributes(value) -> Dict:
+    return value if isinstance(value, dict) else {}
+
+
+def normalize_products_list(value) -> List[Dict]:
+    return [x for x in value if isinstance(x, dict)] if isinstance(value, list) else []
+
+
+def clean_empty_values(obj):
+    """Remove null/empty-string/empty-list/empty-dict recursively from dict/list."""
+    if isinstance(obj, dict):
+        cleaned = {}
+        for key, value in obj.items():
+            if value is None:
+                continue
+            new_value = clean_empty_values(value)
+            if new_value in ("", [], {}):
+                continue
+            cleaned[key] = new_value
+        return cleaned
+    if isinstance(obj, list):
+        cleaned_list = [clean_empty_values(x) for x in obj]
+        return [x for x in cleaned_list if x not in ("", [], {}, None)]
+    if isinstance(obj, str):
+        return normalize_text(obj)
+    return obj
+
+
+def attribute_count_for_result(product_type: str, attributes_obj: Dict) -> int:
+    if not product_type:
+        return 0
+    if attributes_obj.get("nested") is True:
+        products = attributes_obj.get("products", [])
+        count = 0
+        if isinstance(products, list):
+            for product in products:
+                if isinstance(product, dict):
+                    count += sum(1 for key in product.keys() if key != "Product Type")
+        return count
+    return sum(1 for key in attributes_obj.keys() if key != "nested")
+
+
+def classify_exception(exc: Exception, response_text: str = "") -> Tuple[str, str]:
+    text = f"{type(exc).__name__}: {exc} {response_text}"
+    lower = text.lower()
+    if is_oom_text(lower):
+        return "server_failed_oom", text
+    if any(token in lower for token in ["timeout", "timed out", "readtimeout", "connecttimeout"]):
+        return "server_timeout", text
+    if any(token in lower for token in ["connection reset", "connection refused", "remote disconnected", "connection aborted", "connectionerror"]):
+        return "server_connection", text
+    if any(token in lower for token in ["status code: 500", "status_code=500", " 500 ", "internal server error"]):
+        return "server_http_500", text
+    if any(token in lower for token in ["status code: 502", "status_code=502", " 502 ", "bad gateway"]):
+        return "server_http_502", text
+    if any(token in lower for token in ["status code: 503", "status_code=503", " 503 ", "service unavailable"]):
+        return "server_http_503", text
+    if any(token in lower for token in ["status code: 504", "status_code=504", " 504 ", "gateway timeout"]):
+        return "server_http_504", text
+    return "server_unknown", text
+
+
+def make_metric_row(
+    batch_id: int,
+    rows: List[InputRow],
+    status: str,
+    mode: str,
+    attempts_used: int,
+    error_type: str,
+    error: str,
+    start_ts: str,
+    end_ts: str,
+    duration: Optional[float],
+    usage,
+    vllm_delta: Dict,
+) -> Dict:
+    return {
+        "batch_id": batch_id,
+        "rows_in_batch": len(rows),
+        "row_ids": ";".join(str(row.row_id) for row in rows),
+        "status": status,
+        "mode": mode,
+        "attempts_used": attempts_used,
+        "error_type": error_type,
+        "error": error,
+        "start_ts_utc": start_ts,
+        "end_ts_utc": end_ts,
+        "request_duration_sec": round(duration, 4) if duration is not None else "",
+        "rows_per_sec": round(len(rows) / duration, 4) if duration and duration > 0 else "",
+        "prompt_tokens_api": getattr(usage, "prompt_tokens", "") if usage else "",
+        "completion_tokens_api": getattr(usage, "completion_tokens", "") if usage else "",
+        "total_tokens_api": getattr(usage, "total_tokens", "") if usage else "",
+        "prefix_queries_delta": vllm_delta.get("prefix_queries_delta", ""),
+        "prefix_hits_delta": vllm_delta.get("prefix_hits_delta", ""),
+        "prefix_misses_delta": vllm_delta.get("prefix_misses_delta", ""),
+        "prefix_hit_rate_delta": vllm_delta.get("prefix_hit_rate_delta", ""),
+        "kv_cache_usage_before": vllm_delta.get("kv_cache_usage_before", ""),
+        "kv_cache_usage_after": vllm_delta.get("kv_cache_usage_after", ""),
+        "running_requests_before": vllm_delta.get("running_requests_before", ""),
+        "running_requests_after": vllm_delta.get("running_requests_after", ""),
+        "waiting_requests_before": vllm_delta.get("waiting_requests_before", ""),
+        "waiting_requests_after": vllm_delta.get("waiting_requests_after", ""),
+    }
+
+
+def call_model_batch(
+    client: OpenAI,
+    config: Config,
+    batch_id: int,
+    batch_rows: List[InputRow],
+    mode: str,
+) -> BatchResult:
+    prompt = build_batch_prompt(batch_rows)
+    last_error = ""
+    last_error_type = ""
+    last_content = ""
+    start_ts = ""
+    end_ts = ""
+    duration = None
+    usage = None
+    vllm_delta: Dict = {}
+
+    for attempt in range(1, config.server_max_attempts + 1):
+        if attempt > 1:
+            sleep_seconds = config.backoff_seconds[min(attempt - 2, len(config.backoff_seconds) - 1)]
+            time.sleep(sleep_seconds)
+
+        request_start_perf = time.perf_counter()
+        start_ts = utc_now_iso()
+        before = get_vllm_metrics_snapshot(config.metrics_url)
+
+        try:
+            response = client.chat.completions.create(
+                model=config.model_name,
+                temperature=0,
+                max_tokens=config.max_tokens,
+                response_format={"type": "json_object"},
+                timeout=config.request_timeout_seconds,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt},
+                ],
+            )
+            end_ts = utc_now_iso()
+            after = get_vllm_metrics_snapshot(config.metrics_url)
+            duration = time.perf_counter() - request_start_perf
+            vllm_delta = build_vllm_metrics_delta(before, after)
+            usage = getattr(response, "usage", None)
+
+            content = response.choices[0].message.content or "{}"
+            last_content = content
+            parsed = extract_json_object(content)
+            results = parsed.get("results")
+            if not isinstance(results, list):
+                raise ValueError("Model output does not contain results array")
+
+            return build_success_or_model_error_result(
+                batch_id=batch_id,
+                batch_rows=batch_rows,
+                results=results,
+                raw_model_output=last_content,
+                attempts=attempt,
+                metric_row=make_metric_row(
+                    batch_id=batch_id,
+                    rows=batch_rows,
+                    status="success",
+                    mode=mode,
+                    attempts_used=attempt,
+                    error_type="",
+                    error="",
+                    start_ts=start_ts,
+                    end_ts=end_ts,
+                    duration=duration,
+                    usage=usage,
+                    vllm_delta=vllm_delta,
+                ),
+            )
+
+        except ValueError as exc:
+            # Model output / JSON / validation issue. Do not server-retry forever.
+            error_type = "truncated" if looks_truncated(last_content) else "model_error"
+            error_text = str(exc)
+            end_ts = utc_now_iso()
+            after = get_vllm_metrics_snapshot(config.metrics_url)
+            duration = time.perf_counter() - request_start_perf
+            vllm_delta = build_vllm_metrics_delta(before, after)
+            return build_full_model_error_result(
+                batch_id=batch_id,
+                batch_rows=batch_rows,
+                error_type=error_type,
+                error=error_text,
+                raw_model_output=last_content,
+                attempts=attempt,
+                mode=mode,
+                metric_row=make_metric_row(
+                    batch_id=batch_id,
+                    rows=batch_rows,
+                    status=error_type,
+                    mode=mode,
+                    attempts_used=attempt,
+                    error_type=error_type,
+                    error=error_text,
+                    start_ts=start_ts,
+                    end_ts=end_ts,
+                    duration=duration,
+                    usage=usage,
+                    vllm_delta=vllm_delta,
+                ),
+            )
+
+        except Exception as exc:
+            last_error_type, last_error = classify_exception(exc)
+            if last_error_type == "server_failed_oom":
+                metric_row = make_metric_row(
+                    batch_id=batch_id,
+                    rows=batch_rows,
+                    status="server_failed_oom",
+                    mode=mode,
+                    attempts_used=attempt,
+                    error_type=last_error_type,
+                    error=last_error,
+                    start_ts=start_ts,
+                    end_ts=utc_now_iso(),
+                    duration=time.perf_counter() - request_start_perf,
+                    usage=usage,
+                    vllm_delta=build_vllm_metrics_delta(before, get_vllm_metrics_snapshot(config.metrics_url)),
+                )
+                return build_server_failed_result(
+                    batch_id=batch_id,
+                    batch_rows=batch_rows,
+                    error_type="server_failed_oom",
+                    error=last_error,
+                    attempts=attempt,
+                    mode=mode,
+                    metric_row=metric_row,
+                )
+
+            if attempt >= config.server_max_attempts:
+                break
+
+    metric_row = make_metric_row(
+        batch_id=batch_id,
+        rows=batch_rows,
+        status="server_failed",
+        mode=mode,
+        attempts_used=config.server_max_attempts,
+        error_type=last_error_type,
+        error=last_error,
+        start_ts=start_ts,
+        end_ts=utc_now_iso(),
+        duration=duration,
+        usage=usage,
+        vllm_delta=vllm_delta,
+    )
+    return build_server_failed_result(
+        batch_id=batch_id,
+        batch_rows=batch_rows,
+        error_type=last_error_type or "server_failed",
+        error=last_error,
+        attempts=config.server_max_attempts,
+        mode=mode,
+        metric_row=metric_row,
+    )
+
+
+def build_success_or_model_error_result(
+    batch_id: int,
+    batch_rows: List[InputRow],
+    results: List[Dict],
+    raw_model_output: str,
+    metric_row: Dict,
+    attempts: int = 1,
+) -> BatchResult:
+    results_by_row_id: Dict[int, Dict] = {}
+    duplicate_ids = set()
+    for item in results:
+        if not isinstance(item, dict):
+            continue
+        try:
+            row_id = int(item.get("row_id"))
+        except Exception:
+            continue
+        if row_id in results_by_row_id:
+            duplicate_ids.add(row_id)
+        results_by_row_id[row_id] = item
+
+    success_rows: List[Dict] = []
+    low_rows: List[Dict] = []
+    error_rows: List[Dict] = []
+    status_rows: List[Dict] = []
+    row_id_mismatch_count = 0
+    now = utc_now_iso()
+
+    for row in batch_rows:
+        result_item = results_by_row_id.get(row.row_id)
+        if result_item is None:
+            error_type = "missing_result"
+            status = FinalStatus.MODEL_ERROR.value
+            error_rows.append(error_row(row, batch_id, error_type, "Missing result for row_id", raw_model_output))
+            status_rows.append(status_row(row, batch_id, status, "error_output.csv", error_type, attempts, now))
+            row_id_mismatch_count += 1
+            continue
+
+        if row.row_id in duplicate_ids:
+            error_type = "duplicate_result"
+            status = FinalStatus.MODEL_ERROR.value
+            error_rows.append(error_row(row, batch_id, error_type, "Duplicate result for row_id", raw_model_output))
+            status_rows.append(status_row(row, batch_id, status, "error_output.csv", error_type, attempts, now))
+            row_id_mismatch_count += 1
+            continue
+
+        try:
+            nested = result_item.get("nested", False)
+            if nested is True:
+                products = normalize_products_list(result_item.get("products", []))
+                score = result_item.get("canonical_similarity_score", "")
+                try:
+                    score = float(score)
+                except Exception:
+                    score = ""
+                product_type = "NESTED"
+                attributes_obj = clean_empty_values(
+                    {
+                        "nested": True,
+                        "canonical_similarity_score": score,
+                        "products": products,
+                    }
+                )
+                if not products:
+                    raise ValueError("Nested result has empty products list")
+            else:
+                product_type = normalize_product_type(result_item.get("Product Type", ""))
+                attributes = clean_empty_values(normalize_attributes(result_item.get("Attributes", {})))
+                attributes_obj = {"nested": False, **attributes}
+                if not product_type:
+                    raise ValueError("Product Type is empty")
+
+            out = {
+                "row_id": row.row_id,
+                "record_uuid": row.record_uuid,
+                "hs_code": row.hs_code,
+                "product_description": row.product_description,
+                "product_type": product_type,
+                "attributes": json.dumps(attributes_obj, ensure_ascii=False),
+            }
+            attr_len = attribute_count_for_result(product_type, attributes_obj)
+            if attr_len <= LOW_ATTRIBUTE_THRESHOLD:
+                low_rows.append(out)
+                status_rows.append(status_row(row, batch_id, FinalStatus.LOW_ATTRIBUTE.value, "low_attribute_output.csv", "", attempts, now))
+            else:
+                success_rows.append(out)
+                status_rows.append(status_row(row, batch_id, FinalStatus.SUCCESS.value, "success_output.csv", "", attempts, now))
+
+        except Exception as exc:
+            error_type = "validation_error"
+            error_rows.append(error_row(row, batch_id, error_type, str(exc), raw_model_output))
+            status_rows.append(status_row(row, batch_id, FinalStatus.MODEL_ERROR.value, "error_output.csv", error_type, attempts, now))
+
+    if error_rows:
+        metric_row["status"] = "partial_model_error" if (success_rows or low_rows) else "model_error"
+        metric_row["error_type"] = "row_level_model_error"
+        metric_row["error"] = f"{len(error_rows)} row(s) missing/duplicate/invalid"
+
+    # If row_id mismatches (missing or duplicate) account for over half the batch,
+    # this is very unlikely to be a per-row issue -- it usually means the model
+    # returned malformed/misaligned row_ids for the whole batch. These rows still
+    # get MODEL_ERROR status and, importantly, master_status.csv treats any status
+    # as "completed" -- so they will NOT be retried on resume. Surface this loudly
+    # here since it would otherwise disappear silently into individual error rows.
+    if batch_rows and row_id_mismatch_count > len(batch_rows) / 2:
+        preview = raw_model_output[:300].replace("\n", " ")
+        print(
+            f"[ROW_ID MISMATCH] batch_id={batch_id} {row_id_mismatch_count}/{len(batch_rows)} rows "
+            f"missing/duplicate row_id in model response -- likely a malformed/misaligned response, "
+            f"not isolated per-row errors. These rows will be marked model_error and SKIPPED on future "
+            f"resume runs (master_status treats any status as complete). raw_output_preview={preview!r}"
+        )
+
+    return BatchResult(
+        batch_id=batch_id,
+        rows=batch_rows,
+        outcome=BatchOutcome.PARTIAL_MODEL_ERROR if error_rows else BatchOutcome.SUCCESS,
+        success_rows=success_rows,
+        low_attribute_rows=low_rows,
+        error_rows=error_rows,
+        server_failed_rows=[],
+        status_rows=status_rows,
+        metric_row=metric_row,
+        raw_model_output=raw_model_output,
+    )
+
+
+def build_full_model_error_result(
+    batch_id: int,
+    batch_rows: List[InputRow],
+    error_type: str,
+    error: str,
+    raw_model_output: str,
+    attempts: int,
+    mode: str,
+    metric_row: Dict,
+) -> BatchResult:
+    now = utc_now_iso()
+    status = FinalStatus.TRUNCATED.value if error_type == "truncated" else FinalStatus.MODEL_ERROR.value
+    error_rows = [error_row(row, batch_id, error_type, error, raw_model_output) for row in batch_rows]
+    status_rows = [status_row(row, batch_id, status, "error_output.csv", error_type, attempts, now) for row in batch_rows]
+    return BatchResult(
+        batch_id=batch_id,
+        rows=batch_rows,
+        outcome=BatchOutcome.PARTIAL_MODEL_ERROR,
+        success_rows=[],
+        low_attribute_rows=[],
+        error_rows=error_rows,
+        server_failed_rows=[],
+        status_rows=status_rows,
+        metric_row=metric_row,
+        raw_model_output=raw_model_output,
+    )
+
+
+def build_server_failed_result(
+    batch_id: int,
+    batch_rows: List[InputRow],
+    error_type: str,
+    error: str,
+    attempts: int,
+    mode: str,
+    metric_row: Dict,
+) -> BatchResult:
+    now = utc_now_iso()
+    is_oom = error_type == "server_failed_oom"
+    status = FinalStatus.SERVER_FAILED_OOM.value if is_oom else FinalStatus.SERVER_FAILED.value
+    output_file = "server_failed_oom_output.csv" if is_oom else "server_failed_output.csv"
+    server_rows = [server_failed_row(row, batch_id, error_type, error) for row in batch_rows]
+    status_rows = [status_row(row, batch_id, status, output_file, error_type, attempts, now) for row in batch_rows]
+    return BatchResult(
+        batch_id=batch_id,
+        rows=batch_rows,
+        outcome=BatchOutcome.SERVER_FAILED_OOM if error_type == "server_failed_oom" else BatchOutcome.SERVER_FAILED,
+        success_rows=[],
+        low_attribute_rows=[],
+        error_rows=[],
+        server_failed_rows=server_rows,
+        status_rows=status_rows,
+        metric_row=metric_row,
+        server_error_type=error_type,
+    )
+
+
+def error_row(row: InputRow, batch_id: int, error_type: str, error: str, raw_model_output: str) -> Dict:
+    return {
+        "row_id": row.row_id,
+        "record_uuid": row.record_uuid,
+        "batch_id": batch_id,
+        "hs_code": row.hs_code,
+        "product_description": row.product_description,
+        "error_type": error_type,
+        "error": error,
+        "raw_model_output": raw_model_output,
+    }
+
+
+def server_failed_row(row: InputRow, batch_id: int, error_type: str, error: str) -> Dict:
+    return {
+        "row_id": row.row_id,
+        "record_uuid": row.record_uuid,
+        "batch_id": batch_id,
+        "hs_code": row.hs_code,
+        "product_description": row.product_description,
+        "error_type": error_type,
+        "error": error,
+    }
+
+
+def status_row(row: InputRow, batch_id: int, status: str, output_file: str, error_type: str, attempts: int, now: str) -> Dict:
+    return {
+        "row_id": row.row_id,
+        "record_uuid": row.record_uuid,
+        "batch_id": batch_id,
+        "hs_code": row.hs_code,
+        "product_description": row.product_description,
+        "status": status,
+        "output_file": output_file,
+        "error_type": error_type,
+        "attempt_count": attempts,
+        "updated_at_utc": now,
+    }
+
+
+# ============================================================
+# SERVER HEALTH
+# ============================================================
+
+def check_server_startup(config: Config) -> None:
+    models_url = config.base_url.rstrip("/") + "/models"
+    try:
+        response = requests.get(models_url, timeout=20)
+        if response.status_code >= 400:
+            raise RuntimeError(f"Server responded with HTTP {response.status_code}: {response.text[:300]}")
+    except Exception as exc:
+        raise RuntimeError(f"vLLM server is not reachable at {models_url}. Error: {exc}") from exc
+
+    metrics = get_vllm_metrics_snapshot(config.metrics_url)
+    if not metrics:
+        print(f"WARNING: vLLM metrics not reachable or empty at {config.metrics_url}. Job can continue, but backpressure will be weaker.")
+
+
+# ============================================================
+# SCHEDULER
+# ============================================================
+
+class StopRequested(Exception):
+    pass
+
+
+class Runner:
+    def __init__(self, config: Config) -> None:
+        self.config = config
+        self.writer = OutputWriter(
+            config.output_dir,
+            clear_existing=config.clear_existing_outputs,
+            use_sqlite_status=config.use_sqlite_status,
+            status_db_filename=config.status_db_filename,
+            migrate_master_status_to_sqlite=config.migrate_master_status_to_sqlite,
+        )
+        self.status_store = self.writer.status_store
+        self.completed_uuids = {} if self.status_store is not None else load_completed_uuids(self.writer.files["master_status"])
+        self.completed_count = self.status_store.count_completed() if self.status_store is not None else len(self.completed_uuids)
+        self.client = OpenAI(base_url=config.base_url, api_key=config.api_key)
+        self.monitor = BackpressureMonitor(config)
+        self.stop_event = threading.Event()
+        self.batch_id = 0
+        self.total_success = 0
+        self.total_low = 0
+        self.total_errors = 0
+        self.total_server_failed = 0
+        self.consecutive_server_failures = 0
+
+    def request_stop(self, signum=None, frame=None) -> None:
+        print("\nStop requested. Waiting for current completed futures to be written safely...")
+        self.stop_event.set()
+
+    def next_batch_id(self) -> int:
+        self.batch_id += 1
+        return self.batch_id
+
+    def run(self) -> None:
+        print("========== ATTRIBUTE PRODUCTION RUN START ==========")
+        print(f"Model: {self.config.model_name}")
+        print(f"Input file: {self.config.input_file}")
+        print(f"Output dir: {self.config.output_dir}")
+        print(f"Batch size: {self.config.batch_size}")
+        print(f"Normal workers: {self.config.normal_workers}")
+        print(f"Backpressure workers: {self.config.backpressure_workers}")
+        print(f"Resume backend: {'SQLite status.db' if self.status_store is not None else 'CSV master_status.csv'}")
+        if self.status_store is not None:
+            print(f"Status DB: {self.writer.files['status_db']}")
+        print(f"Completed rows from resume backend: {self.completed_count}")
+        print("====================================================")
+
+        check_server_startup(self.config)
+
+        total_valid_rows, already_completed_rows, pending_rows = count_workload(self.config, self.completed_uuids, self.status_store)
+        total_batches = (pending_rows + self.config.batch_size - 1) // self.config.batch_size if pending_rows else 0
+
+        print("\n========== RUN WORKLOAD SUMMARY ==========")
+        print(f"Total valid input rows: {total_valid_rows}")
+        print(f"Already completed/skipped rows: {already_completed_rows}")
+        print(f"Rows pending this run: {pending_rows}")
+        print(f"Total batches this run: {total_batches}")
+        print("==========================================\n")
+
+        run_start_perf = time.perf_counter()
+        completed_batches = 0
+        processed_rows_this_run = 0
+
+        rows_iter = input_row_generator(self.config, self.completed_uuids, self.status_store)
+        batches_iter = batch_generator(rows_iter, self.config.batch_size)
+        futures: Dict = {}
+        exhausted = False
+
+        executor = ThreadPoolExecutor(max_workers=self.config.normal_workers)
+        try:
+            try:
+                while not exhausted or futures:
+                    if self.stop_event.is_set():
+                        raise StopRequested()
+
+                    mode, allowed_workers = self.monitor.current_limits()
+
+                    # len(futures) IS the current in-flight/concurrency count, so the
+                    # submit gate must use allowed_workers (12 in backpressure, 40 in
+                    # normal mode) -- not max_in_flight, which was only ever a queue
+                    # multiplier and did not actually reduce concurrent requests.
+                    while not exhausted and len(futures) < allowed_workers and not self.stop_event.is_set():
+                        try:
+                            batch_rows = next(batches_iter)
+                        except StopIteration:
+                            exhausted = True
+                            break
+                        batch_id = self.next_batch_id()
+                        future = executor.submit(call_model_batch, self.client, self.config, batch_id, batch_rows, mode)
+                        futures[future] = (batch_id, batch_rows)
+
+                    if not futures:
+                        break
+
+                    done, _ = wait(set(futures.keys()), timeout=5, return_when=FIRST_COMPLETED)
+                    if not done:
+                        self.monitor.poll_if_needed()
+                        continue
+
+                    for future in done:
+                        batch_id, batch_rows = futures.pop(future)
+                        try:
+                            result = future.result()
+                        except Exception as exc:
+                            error_type, error_text = classify_exception(exc)
+                            if error_type == "server_failed_oom":
+                                self.writer.write_oom_rows(batch_rows, batch_id, error_text, 1)
+                                print(f"OOM detected for batch {batch_id}. Aborting immediately.")
+                                raise StopRequested()
+                            metric_row = make_metric_row(
+                                batch_id=batch_id,
+                                rows=batch_rows,
+                                status="server_failed",
+                                mode=mode,
+                                attempts_used=1,
+                                error_type=error_type,
+                                error=error_text,
+                                start_ts="",
+                                end_ts=utc_now_iso(),
+                                duration=None,
+                                usage=None,
+                                vllm_delta={},
+                            )
+                            result = build_server_failed_result(batch_id, batch_rows, error_type, error_text, 1, mode, metric_row)
+
+                        self.writer.write_batch_result(result)
+                        self.update_counts_and_failures(result)
+
+                        completed_batches += 1
+                        processed_rows_this_run += len(batch_rows)
+                        elapsed = time.perf_counter() - run_start_perf
+                        avg_rows_sec = processed_rows_this_run / elapsed if elapsed > 0 else 0.0
+
+                        print(
+                            f"Completed batch {batch_id} ({completed_batches}/{total_batches}) | "
+                            f"elapsed={format_elapsed(elapsed)} | "
+                            f"cum_rows={processed_rows_this_run}/{pending_rows} | "
+                            f"avg_rows_sec={avg_rows_sec:.3f} | "
+                            f"status={result.metric_row.get('status')} | "
+                            f"success={len(result.success_rows)} | low={len(result.low_attribute_rows)} | "
+                            f"errors={len(result.error_rows)} | server_failed={len(result.server_failed_rows)} | "
+                            f"consecutive_server_failures={self.consecutive_server_failures}"
+                        )
+
+                        if result.outcome == BatchOutcome.SERVER_FAILED_OOM:
+                            print(f"OOM detected for batch {batch_id}. Aborting immediately.")
+                            raise StopRequested()
+
+                        if self.consecutive_server_failures >= self.config.max_consecutive_server_failures:
+                            print(
+                                f"Aborting: consecutive server failed batches reached "
+                                f"{self.consecutive_server_failures}."
+                            )
+                            raise StopRequested()
+
+            except StopRequested:
+                self.stop_event.set()
+            finally:
+                if futures:
+                    print(
+                        f"\nWaiting up to {self.config.graceful_shutdown_wait_seconds} sec "
+                        f"for {len(futures)} in-flight batch(es) to finish before exiting safely..."
+                    )
+                    done_futures, not_done_futures = wait(
+                        set(futures.keys()),
+                        timeout=self.config.graceful_shutdown_wait_seconds,
+                        return_when=ALL_COMPLETED,
+                    )
+
+                    for future in done_futures:
+                        popped = futures.pop(future, None)
+                        if popped is None:
+                            continue
+                        batch_id, batch_rows = popped
+                        try:
+                            result = future.result()
+                        except Exception as exc:
+                            error_type, error_text = classify_exception(exc)
+                            metric_row = make_metric_row(
+                                batch_id=batch_id,
+                                rows=batch_rows,
+                                status="server_failed",
+                                mode="shutdown_drain",
+                                attempts_used=1,
+                                error_type=error_type,
+                                error=error_text,
+                                start_ts="",
+                                end_ts=utc_now_iso(),
+                                duration=None,
+                                usage=None,
+                                vllm_delta={},
+                            )
+                            result = build_server_failed_result(
+                                batch_id=batch_id,
+                                batch_rows=batch_rows,
+                                error_type=error_type,
+                                error=error_text,
+                                attempts=1,
+                                mode="shutdown_drain",
+                                metric_row=metric_row,
+                            )
+
+                        self.writer.write_batch_result(result)
+                        self.update_counts_and_failures(result)
+                        completed_batches += 1
+                        processed_rows_this_run += len(batch_rows)
+
+                    if done_futures:
+                        print(f"Saved {len(done_futures)} in-flight batch(es) during shutdown drain.")
+
+                    if not_done_futures:
+                        unsaved_rows = sum(len(futures[f][1]) for f in not_done_futures if f in futures)
+                        print(
+                            f"Shutdown drain timeout reached. {len(not_done_futures)} batch(es), "
+                            f"{unsaved_rows} row(s) were not saved. They will be retried on next resume."
+                        )
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+
+        total_elapsed = time.perf_counter() - run_start_perf
+        final_avg_rows_sec = processed_rows_this_run / total_elapsed if total_elapsed > 0 else 0.0
+
+        print("\n========== ATTRIBUTE PRODUCTION RUN COMPLETE/STOPPED ==========")
+        print(f"Total processing time: {format_elapsed(total_elapsed)} ({total_elapsed:.2f} sec)")
+        print(f"Total processed rows this run: {processed_rows_this_run}")
+        print(f"Average throughput: {final_avg_rows_sec:.3f} rows/sec")
+        print(f"Successful output rows: {self.total_success}")
+        print(f"Low attribute rows: {self.total_low}")
+        print(f"Model/error rows: {self.total_errors}")
+        print(f"Server failed rows: {self.total_server_failed}")
+        if self.status_store is not None:
+            print(f"SQLite status DB: {self.writer.files['status_db']}")
+        print(f"Master status audit CSV: {self.writer.files['master_status']}")
+        print("===============================================================")
+
+    def update_counts_and_failures(self, result: BatchResult) -> None:
+        self.total_success += len(result.success_rows)
+        self.total_low += len(result.low_attribute_rows)
+        self.total_errors += len(result.error_rows)
+        self.total_server_failed += len(result.server_failed_rows)
+
+        if result.outcome in (BatchOutcome.SERVER_FAILED, BatchOutcome.SERVER_FAILED_OOM):
+            self.consecutive_server_failures += 1
+            self.monitor.record_server_error()
+        else:
+            self.consecutive_server_failures = 0
+            self.monitor.record_success()
+
+
+# ============================================================
+# CLI
+# ============================================================
+
+def parse_args() -> Config:
+    """Build config from USER CONFIG section at top of file.
+
+    No terminal arguments are required. Edit INPUT_FILE, OUTPUT_DIR, and column
+    names at the top of this script. MAX_RECORDS can be "AUTO", None, or an int.
+    """
+    if isinstance(MAX_RECORDS, str) and MAX_RECORDS.strip().upper() == "AUTO":
+        resolved_max_records = count_valid_csv_rows_for_max_records(
+            INPUT_FILE,
+            DEFAULT_CHUNKSIZE,
+            HS_CODE_COLUMN,
+            DESCRIPTION_COLUMN,
+            UUID_COLUMN,
+        )
+        print(f"AUTO MAX_RECORDS resolved from CSV valid rows: {resolved_max_records}")
+    else:
+        resolved_max_records = MAX_RECORDS
+
+    return Config(
+        input_file=INPUT_FILE,
+        output_dir=OUTPUT_DIR,
+        base_url=DEFAULT_BASE_URL,
+        metrics_url=DEFAULT_VLLM_METRICS_URL,
+        api_key=DEFAULT_API_KEY,
+        model_name=DEFAULT_MODEL_NAME,
+        batch_size=DEFAULT_BATCH_SIZE,
+        normal_workers=DEFAULT_NORMAL_WORKERS,
+        backpressure_workers=DEFAULT_BACKPRESSURE_WORKERS,
+        max_tokens=DEFAULT_MAX_TOKENS,
+        graceful_shutdown_wait_seconds=DEFAULT_GRACEFUL_SHUTDOWN_WAIT_SECONDS,
+        request_timeout_seconds=DEFAULT_REQUEST_TIMEOUT_SECONDS,
+        server_max_attempts=DEFAULT_SERVER_MAX_ATTEMPTS,
+        backoff_seconds=DEFAULT_BACKOFF_SECONDS,
+        max_consecutive_server_failures=DEFAULT_MAX_CONSECUTIVE_SERVER_FAILURES,
+        metrics_poll_seconds=DEFAULT_METRICS_POLL_SECONDS,
+        backpressure_duration_seconds=DEFAULT_BACKPRESSURE_DURATION_SECONDS,
+        kv_immediate_backpressure=DEFAULT_KV_IMMEDIATE_BACKPRESSURE,
+        kv_streak_backpressure=DEFAULT_KV_STREAK_BACKPRESSURE,
+        kv_streak_checks=DEFAULT_KV_STREAK_CHECKS,
+        kv_exit_streak_checks=DEFAULT_KV_EXIT_STREAK_CHECKS,
+        kv_exit_backpressure=DEFAULT_KV_EXIT_BACKPRESSURE,
+        waiting_high=DEFAULT_WAITING_HIGH,
+        waiting_high_streak_checks=DEFAULT_WAITING_HIGH_STREAK_CHECKS,
+        chunksize=DEFAULT_CHUNKSIZE,
+        max_records=resolved_max_records,
+        clear_existing_outputs=CLEAR_EXISTING_OUTPUTS,
+        hs_code_column=HS_CODE_COLUMN,
+        description_column=DESCRIPTION_COLUMN,
+        uuid_column=UUID_COLUMN,
+        use_sqlite_status=USE_SQLITE_STATUS,
+        status_db_filename=STATUS_DB_FILENAME,
+        migrate_master_status_to_sqlite=MIGRATE_MASTER_STATUS_TO_SQLITE,
+    )
+
+def main() -> None:
+    config = parse_args()
+    runner = Runner(config)
+    signal.signal(signal.SIGINT, runner.request_stop)
+    signal.signal(signal.SIGTERM, runner.request_stop)
+    try:
+        runner.run()
+    finally:
+        runner.writer.close()
+
+
+if __name__ == "__main__":
+    main()
